@@ -979,7 +979,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 left: 24,
                 right: 24,
                 top: 16,
-                bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 24 + MediaQuery.of(context).padding.bottom,
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -1311,10 +1311,17 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       debugPrint('이미지 업로드 실패: $e');
       if (mounted) {
+        String errorMsg = '이미지 선택 또는 업로드에 실패했습니다.';
+        if (e.toString().contains('object-not-found') || e.toString().contains('bucket') || e.toString().contains('storage')) {
+          errorMsg = 'Firebase Storage 서비스가 비활성화 상태입니다. 프리셋 아바타 캐릭터를 선택해 주세요.';
+        } else {
+          errorMsg = '$errorMsg ($e)';
+        }
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('이미지 선택 또는 업로드에 실패했습니다: $e'),
+            content: Text(errorMsg),
             backgroundColor: tossRed,
+            duration: const Duration(seconds: 4),
           ),
         );
       }
@@ -1327,6 +1334,7 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final String uid = widget.user.uid;
       
+      // 1. Firestore 업데이트 (가장 중요하며, 앱 내 마커와 카드 표출에 사용됨)
       await FirebaseFirestore.instance
           .collection('users')
           .doc(uid)
@@ -1335,13 +1343,19 @@ class _HomeScreenState extends State<HomeScreen> {
         'photoUrl': photoUrl,
       });
       
-      final currentUser = FirebaseAuth.instance.currentUser;
-      if (currentUser != null) {
-        await currentUser.updateDisplayName(name);
-        if (photoUrl.isNotEmpty) {
-          await currentUser.updatePhotoURL(photoUrl);
+      // 2. Firebase Auth 업데이트 (선택 사항이며, 실패해도 Firestore가 성공했으므로 진행)
+      try {
+        final currentUser = FirebaseAuth.instance.currentUser;
+        if (currentUser != null) {
+          await currentUser.updateDisplayName(name);
+          if (photoUrl.isNotEmpty) {
+            await currentUser.updatePhotoURL(photoUrl);
+          }
         }
+      } catch (authError) {
+        debugPrint('FirebaseAuth 로컬 프로필 업데이트 실패 (무시됨): $authError');
       }
+      
       return true;
     } catch (e) {
       debugPrint('프로필 업데이트 실패: $e');
@@ -2126,6 +2140,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // Uber 즐겨찾기 스타일 - 안심존 추가 시트 (StatefulBuilder 자체 완결)
   void _showAddSafeZoneSheet() {
+    final searchController = TextEditingController();
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -2137,7 +2153,6 @@ class _HomeScreenState extends State<HomeScreen> {
       builder: (ctx) {
         // 시트 전용 로컬 상태 (StatefulBuilder)
         String zoneName = '';
-        String searchQuery = '';
         List<dynamic> results = [];
         bool isSearching = false;
         double? selLat;
@@ -2159,14 +2174,33 @@ class _HomeScreenState extends State<HomeScreen> {
                   '&format=json&limit=6&accept-language=ko&countrycodes=kr'
                 );
                 final req = await client.getUrl(url);
-                req.headers.set(HttpHeaders.userAgentHeader, 'GuardianApp/1.0');
+                req.headers.set(HttpHeaders.userAgentHeader, 'TheGuardianFamilySafetyApp/1.0 (basil@guardian.local)');
                 final res = await req.close().timeout(const Duration(seconds: 10));
                 if (res.statusCode == 200) {
                   final body = await res.transform(utf8.decoder).join();
-                  setSheet(() => results = json.decode(body));
+                  final decoded = json.decode(body) as List<dynamic>;
+                  if (decoded.isEmpty) {
+                    if (ctx.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('검색 결과가 없습니다. 다른 검색어를 입력해 보세요.')),
+                      );
+                    }
+                  }
+                  setSheet(() => results = decoded);
+                } else {
+                  if (ctx.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('주소 검색 서버 오류가 발생했습니다. (코드: ${res.statusCode})')),
+                    );
+                  }
                 }
               } catch (e) {
                 debugPrint('장소 검색 오류: $e');
+                if (ctx.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('주소 검색에 실패했습니다. 네트워크 상태를 확인해 주세요. ($e)')),
+                  );
+                }
               } finally {
                 setSheet(() => isSearching = false);
               }
@@ -2273,7 +2307,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           Row(children: [
                             Expanded(
                               child: TextField(
-                                onChanged: (v) => setSheet(() => searchQuery = v),
+                                controller: searchController,
                                 onSubmitted: doSearch,
                                 decoration: InputDecoration(
                                   hintText: '주소 또는 장소명 검색',
@@ -2287,7 +2321,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             ),
                             const SizedBox(width: 10),
                             TossBounce(
-                              onTap: () => doSearch(searchQuery),
+                              onTap: () => doSearch(searchController.text),
                               child: Container(
                                 width: 50, height: 50,
                                 decoration: BoxDecoration(color: tossBlue, borderRadius: BorderRadius.circular(14)),
@@ -2377,7 +2411,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
                     // 등록 버튼
                     Container(
-                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+                      padding: EdgeInsets.fromLTRB(20, 12, 20, 20 + MediaQuery.of(ctx).padding.bottom),
                       decoration: const BoxDecoration(color: cardBg),
                       child: TossBounce(
                         onTap: doRegister,
@@ -2404,7 +2438,9 @@ class _HomeScreenState extends State<HomeScreen> {
           },
         );
       },
-    );
+    ).then((_) {
+      searchController.dispose();
+    });
   }
 
   Widget _buildBatteryBadge(int batteryLevel) {
