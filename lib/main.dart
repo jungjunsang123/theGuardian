@@ -1,0 +1,2581 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
+import 'dart:io';
+import 'dart:convert';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter_naver_map/flutter_naver_map.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:battery_plus/battery_plus.dart';
+import 'dart:math';
+import 'dart:ui';
+
+// Apple & Toss 스타일의 프리미엄 라이트 테마 컬러 세트
+const Color appBg = Color(0xFFF2F4F6); // 토스 라이트 그레이 배경
+const Color cardBg = Color(0xFFFFFFFF); // 완벽한 화이트 카드 배경
+const Color textPrimary = Color(0xFF333D4B); // 토스 본문 다크 그레이
+const Color textSecondary = Color(0xFF8B95A1); // 토스 부연 설명 그레이
+const Color tossBlue = Color(0xFF3182F6); // 토스 블루
+const Color tossRed = Color(0xFFF04452); // 토스 레드
+const Color appleGray = Color(0xFFE5E8EB); // 라이트 회색 대용
+
+// 6자리 랜덤 초대 코드 생성기
+String _generateInviteCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  final rnd = Random();
+  return String.fromCharCodes(Iterable.generate(
+      6, (_) => chars.codeUnitAt(rnd.nextInt(chars.length))));
+}
+
+// -----------------------------------------------------------------------------
+// 백그라운드 위치 서비스 초기화 및 시작 함수
+// -----------------------------------------------------------------------------
+Future<void> initializeBackgroundService(String uid) async {
+  final service = FlutterBackgroundService();
+
+  // 이미 실행 중이면 세션만 설정해 줍니다.
+  final isRunning = await service.isRunning();
+  if (isRunning) {
+    service.invoke('setUid', {'uid': uid});
+    return;
+  }
+
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onStart,
+      autoStart: true,
+      isForegroundMode: true,
+      notificationChannelId: 'the_guardian_location',
+      initialNotificationTitle: 'The Guardian 구동 중',
+      initialNotificationContent: '백그라운드에서 실시간 위치를 보호하고 있습니다.',
+      foregroundServiceNotificationId: 888,
+    ),
+    iosConfiguration: IosConfiguration(
+      autoStart: true,
+      onForeground: onStart,
+      onBackground: onIosBackground,
+    ),
+  );
+
+  await service.startService();
+  service.invoke('setUid', {'uid': uid});
+}
+
+@pragma('vm:entry-point')
+bool onIosBackground(ServiceInstance service) {
+  WidgetsFlutterBinding.ensureInitialized();
+  return true;
+}
+
+@pragma('vm:entry-point')
+void onStart(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+
+  String? currentUid;
+
+  service.on('setUid').listen((event) {
+    if (event != null) {
+      currentUid = event['uid'];
+    }
+  });
+
+  service.on('stopService').listen((event) {
+    service.stopSelf();
+  });
+
+  // 백그라운드 위치 트래킹 스트림 시작
+  Geolocator.getPositionStream(
+    locationSettings: const LocationSettings(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: 15, // 15미터 이상 이동 시 수집
+    ),
+  ).listen((Position position) async {
+    if (currentUid == null) return;
+
+    final userDocRef = FirebaseFirestore.instance.collection('users').doc(currentUid);
+    final doc = await userDocRef.get();
+    if (!doc.exists) return;
+
+    final data = doc.data() as Map<String, dynamic>;
+    final safeZones = data['safeZones'] as List<dynamic>? ?? [];
+
+    bool isInsideAnySafeZone = false;
+    String insideZoneName = '';
+
+    // 모든 등록된 안심존(Safe Zone) 검사
+    for (var zone in safeZones) {
+      final double distance = Geolocator.distanceBetween(
+        position.latitude,
+        position.longitude,
+        zone['latitude'],
+        zone['longitude'],
+      );
+      if (distance <= (zone['radius'] ?? 100.0)) {
+        isInsideAnySafeZone = true;
+        insideZoneName = zone['name'] ?? '안심존';
+        break;
+      }
+    }
+
+    final battery = Battery();
+    final int batteryLevel = await battery.batteryLevel;
+
+    if (isInsideAnySafeZone) {
+      // 안심존 내부인 경우: 배터리를 아끼기 위해 Firestore 업데이트 생략 (상태가 변경될 때만 1회 기록)
+      final String? prevStatus = data['status'];
+      if (prevStatus == 'safe_$insideZoneName') {
+        return; // 쓰기 작업 생략
+      }
+
+      await userDocRef.update({
+        'latitude': position.latitude,
+        'longitude': position.longitude,
+        'battery': batteryLevel,
+        'status': 'safe_$insideZoneName',
+        'lastActive': FieldValue.serverTimestamp(),
+      });
+    } else {
+      // 안심존 외부일 때: 10분 주기로 위치 실시간 수집 및 Firestore 전송
+      final Timestamp? lastActive = data['lastActive'] as Timestamp?;
+      final now = DateTime.now();
+
+      if (lastActive == null ||
+          now.difference(lastActive.toDate()).inMinutes >= 10 ||
+          data['status'] != 'moving') {
+        
+        await userDocRef.update({
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'battery': batteryLevel,
+          'status': 'moving',
+          'lastActive': FieldValue.serverTimestamp(),
+        });
+
+        // 7일 파기 대상 실시간 위치 기록을 서브컬렉션으로 누적
+        await userDocRef.collection('history').add({
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'timestamp': FieldValue.serverTimestamp(),
+        });
+      }
+    }
+  });
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await Firebase.initializeApp();
+    if (!kIsWeb) {
+      // 네이버 지도 SDK 초기화 (Client ID 등록)
+      await FlutterNaverMap().init(
+        clientId: '2kij3oiucs',
+        onAuthFailed: (e) => debugPrint('네이버 지도 인증 실패: $e'),
+      );
+    }
+    await GoogleSignIn.instance.initialize(
+      serverClientId: '246238512248-2foqjr7mkpifvkak6b8lsjhuq26j5us8.apps.googleusercontent.com',
+    );
+  } catch (e) {
+    debugPrint('초기화 실패: $e');
+  }
+  runApp(const TheGuardianApp());
+}
+
+class TheGuardianApp extends StatelessWidget {
+  const TheGuardianApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'The Guardian',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.light,
+        scaffoldBackgroundColor: appBg,
+        primaryColor: tossBlue,
+        colorScheme: const ColorScheme.light(
+          primary: tossBlue,
+          secondary: tossRed,
+          surface: cardBg,
+        ),
+        fontFamily: 'Pretendard',
+      ),
+      home: StreamBuilder<User?>(
+        stream: FirebaseAuth.instance.authStateChanges(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Scaffold(
+              body: Center(
+                child: CircularProgressIndicator(color: tossBlue),
+              ),
+            );
+          }
+          if (snapshot.hasData && snapshot.data != null) {
+            return HomeScreen(user: snapshot.data!);
+          }
+          return const LoginScreen();
+        },
+      ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Toss & Apple 스타일의 바운스 터치 애니메이션 위젯 (TossBounce)
+// -----------------------------------------------------------------------------
+class TossBounce extends StatefulWidget {
+  final Widget child;
+  final VoidCallback? onTap;
+
+  const TossBounce({super.key, required this.child, this.onTap});
+
+  @override
+  State<TossBounce> createState() => _TossBounceState();
+}
+
+class _TossBounceState extends State<TossBounce> with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _scale;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 80),
+    );
+    _scale = Tween<double>(begin: 1.0, end: 0.94).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) {
+        _controller.forward();
+        HapticFeedback.lightImpact();
+      },
+      onTapUp: (_) {
+        _controller.reverse();
+        widget.onTap?.call();
+      },
+      onTapCancel: () {
+        _controller.reverse();
+      },
+      child: ScaleTransition(
+        scale: _scale,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 로그인 화면 (LoginScreen)
+// -----------------------------------------------------------------------------
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  bool _isLoading = false;
+
+  Future<void> _signInWithGoogle() async {
+    setState(() => _isLoading = true);
+    try {
+      final GoogleSignInAccount? googleUser = await GoogleSignIn.instance.authenticate();
+      if (googleUser == null) {
+        setState(() => _isLoading = false);
+        return;
+      }
+
+      final GoogleSignInAuthentication googleAuth = googleUser.authentication;
+      final OAuthCredential credential = GoogleAuthProvider.credential(
+        idToken: googleAuth.idToken,
+      );
+
+      final UserCredential userCredential =
+          await FirebaseAuth.instance.signInWithCredential(credential);
+      final User? user = userCredential.user;
+
+      if (user != null) {
+        final userDocRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
+        final userDoc = await userDocRef.get();
+
+        String inviteCode;
+        String groupId;
+
+        if (userDoc.exists && userDoc.data() != null) {
+          final data = userDoc.data()!;
+          inviteCode = data['inviteCode'] ?? _generateInviteCode();
+          groupId = data['groupId'] ?? user.uid;
+        } else {
+          inviteCode = _generateInviteCode();
+          groupId = user.uid;
+        }
+
+        await userDocRef.set({
+          'uid': user.uid,
+          'name': user.displayName ?? '이름 없음',
+          'email': user.email ?? '이메일 없음',
+          'photoUrl': user.photoURL ?? '',
+          'lastActive': FieldValue.serverTimestamp(),
+          'inviteCode': inviteCode,
+          'groupId': groupId,
+          'battery': 100,
+          'latitude': 37.5665,
+          'longitude': 126.9780,
+          'geofenceLat': null,
+          'geofenceLng': null,
+          'geofenceName': null,
+          'geofenceRadius': 100.0,
+          'safeZones': [], // 다중 안심존 배열 초기화
+        }, SetOptions(merge: true));
+      }
+    } catch (e) {
+      debugPrint('구글 로그인 에러: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('로그인 실패: SHA-1이 등록되지 않았거나 네트워크 오류입니다. ($e)'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  Future<void> _signInAnonymously() async {
+    setState(() => _isLoading = true);
+    try {
+      final UserCredential userCredential =
+          await FirebaseAuth.instance.signInAnonymously();
+      final User? user = userCredential.user;
+
+      if (user != null) {
+        final userDocRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
+        final userDoc = await userDocRef.get();
+
+        String inviteCode;
+        String groupId;
+
+        if (userDoc.exists && userDoc.data() != null) {
+          final data = userDoc.data()!;
+          inviteCode = data['inviteCode'] ?? _generateInviteCode();
+          groupId = data['groupId'] ?? user.uid;
+        } else {
+          inviteCode = _generateInviteCode();
+          groupId = user.uid;
+        }
+
+        await userDocRef.set({
+          'uid': user.uid,
+          'name': '테스트 기기(아이패드)',
+          'email': 'test@guardian.local',
+          'photoUrl': 'https://www.gstatic.com/images/branding/product/2x/avatar_anonymous_96dp.png',
+          'lastActive': FieldValue.serverTimestamp(),
+          'inviteCode': inviteCode,
+          'groupId': groupId,
+          'battery': 100,
+          'latitude': 37.5665,
+          'longitude': 126.9780,
+          'geofenceLat': null,
+          'geofenceLng': null,
+          'geofenceName': null,
+          'geofenceRadius': 100.0,
+          'safeZones': [],
+        }, SetOptions(merge: true));
+      }
+    } catch (e) {
+      debugPrint('익명 로그인 에러: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('익명 로그인 실패: Firebase Console에서 익명 로그인을 활성화해야 합니다. ($e)'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        width: double.infinity,
+        height: double.infinity,
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.white, appBg],
+          ),
+        ),
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Spacer(flex: 2),
+                Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: tossBlue.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: const Icon(
+                    Icons.security,
+                    size: 28,
+                    color: tossBlue,
+                  ),
+                ),
+                const SizedBox(height: 28),
+                const Text(
+                  '소중한 가족의 위치\n언제나 안전하게.',
+                  style: TextStyle(
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    height: 1.35,
+                    color: textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'The Guardian은 불필요한 배터리 소모 없이\n가족의 안심존 출입과 실시간 위치를 보호합니다.',
+                  style: TextStyle(
+                    fontSize: 15,
+                    color: textSecondary,
+                    height: 1.5,
+                  ),
+                ),
+                const Spacer(flex: 3),
+                Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: cardBg,
+                    borderRadius: BorderRadius.circular(24),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.04),
+                        blurRadius: 16,
+                        offset: const Offset(0, 8),
+                      ),
+                    ],
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.shield, color: tossBlue, size: 24),
+                      SizedBox(width: 14),
+                      Expanded(
+                        child: Text(
+                          '비밀번호 없이 구글 보안 연동만으로\n가장 안전하고 빠르게 가입할 수 있어요.',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: textSecondary,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+                _isLoading
+                    ? const Center(child: CircularProgressIndicator(color: tossBlue))
+                    : Column(
+                        children: [
+                          TossBounce(
+                            onTap: _signInWithGoogle,
+                            child: Container(
+                              width: double.infinity,
+                              height: 58,
+                              decoration: BoxDecoration(
+                                color: Colors.white,
+                                borderRadius: BorderRadius.circular(20),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.1),
+                                    blurRadius: 12,
+                                    offset: const Offset(0, 4),
+                                  ),
+                                ],
+                              ),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Image.network(
+                                    'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/1024px-Google_%22G%22_logo.svg.png',
+                                    width: 22,
+                                    height: 22,
+                                    errorBuilder: (context, error, stackTrace) => const Icon(
+                                      Icons.login,
+                                      size: 22,
+                                      color: tossBlue,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  const Text(
+                                    'Google 계정으로 시작하기',
+                                    style: TextStyle(
+                                      color: Color(0xFF1E293B),
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          TossBounce(
+                            onTap: _signInAnonymously,
+                            child: Container(
+                              width: double.infinity,
+                              height: 50,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFE8F3FF),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  const Icon(Icons.phonelink_setup_outlined, color: tossBlue, size: 20),
+                                  const SizedBox(width: 12),
+                                  const Text(
+                                    '임시 테스트 계정으로 시작하기',
+                                    style: TextStyle(
+                                      color: tossBlue,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                const SizedBox(height: 24),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 메인 화면 (HomeScreen)
+// -----------------------------------------------------------------------------
+class HomeScreen extends StatefulWidget {
+  final User user;
+
+  const HomeScreen({super.key, required this.user});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final TextEditingController _inviteCodeController = TextEditingController();
+  final TextEditingController _zoneNameController = TextEditingController();
+  final TextEditingController _searchQueryController = TextEditingController();
+  
+  double? _selectedLat; // 검색으로 선택된 위치 위도
+  double? _selectedLng; // 검색으로 선택된 위치 경도
+  
+  NaverMapController? _mapController;
+  bool _isRegistering = false;
+  bool _isUpdatingOverlays = false; // 마커 업데이트 재진입 방지
+
+  @override
+  void initState() {
+    super.initState();
+    // 로그인 시 백그라운드 구동에 필요한 위치 및 알림 권한을 요청합니다.
+    _requestLocationPermissions();
+  }
+
+  @override
+  void dispose() {
+    _inviteCodeController.dispose();
+    _zoneNameController.dispose();
+    _searchQueryController.dispose();
+    super.dispose();
+  }
+
+  // 위치 권한 요청 함수
+  Future<void> _requestLocationPermissions() async {
+    if (kIsWeb) return;
+    var status = await Permission.location.request();
+    if (status.isGranted) {
+      await Permission.locationAlways.request();
+      await Permission.notification.request();
+      
+      // 권한이 승인되면 실시간 백그라운드 위치 기록 서비스 기동
+      await initializeBackgroundService(widget.user.uid);
+
+      if (_mapController != null) {
+        _mapController!.setLocationTrackingMode(NLocationTrackingMode.follow);
+      }
+    }
+  }
+  Future<void> _joinGroupWithCode(String code) async {
+    code = code.trim().toUpperCase();
+    if (code.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('초대 코드를 입력해 주세요.')),
+      );
+      return;
+    }
+
+    setState(() => _isRegistering = true);
+
+    try {
+      // 1. /groups 컬렉션에서 초대 코드 검색
+      final QuerySnapshot groupQuery = await FirebaseFirestore.instance
+          .collection('groups')
+          .where('inviteCode', isEqualTo: code)
+          .limit(1)
+          .get();
+
+      if (groupQuery.docs.isNotEmpty) {
+        final DocumentSnapshot groupDoc = groupQuery.docs.first;
+        final String groupId = groupDoc.id;
+        final Map<String, dynamic> groupData = groupDoc.data() as Map<String, dynamic>;
+        final String groupName = groupData['name'] ?? '그룹';
+        final List<dynamic> members = groupData['members'] ?? [];
+
+        if (members.contains(widget.user.uid)) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('이미 [$groupName] 그룹의 멤버입니다.')),
+            );
+          }
+          return;
+        }
+
+        // 그룹 멤버에 추가 및 activeGroupId 업데이트
+        await FirebaseFirestore.instance.collection('groups').doc(groupId).update({
+          'members': FieldValue.arrayUnion([widget.user.uid])
+        });
+
+        await FirebaseFirestore.instance.collection('users').doc(widget.user.uid).update({
+          'activeGroupId': groupId,
+          'groupId': groupId, // 하위 호환성 유지
+        });
+
+        if (mounted) {
+          _inviteCodeController.clear();
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('[$groupName] 그룹에 참여했어요!'),
+              backgroundColor: Theme.of(context).colorScheme.secondary,
+            ),
+          );
+        }
+        return;
+      }
+
+      // 2. /groups에서 못 찾았을 경우, 하위 호환성을 위해 /users에서 초대 코드 검색 (기존 개인 코드 대응)
+      final QuerySnapshot userQuery = await FirebaseFirestore.instance
+          .collection('users')
+          .where('inviteCode', isEqualTo: code)
+          .limit(1)
+          .get();
+
+      if (userQuery.docs.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('해당 초대 코드를 가진 그룹이나 사용자를 찾을 수 없습니다.'),
+              backgroundColor: Colors.redAccent,
+            ),
+          );
+        }
+        return;
+      }
+
+      final DocumentSnapshot targetUserDoc = userQuery.docs.first;
+      final Map<String, dynamic> targetData = targetUserDoc.data() as Map<String, dynamic>;
+      final String targetGroupId = targetData['groupId'] ?? targetUserDoc.id;
+      final String targetName = targetData['name'] ?? '가족';
+
+      if (targetUserDoc.id == widget.user.uid) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('본인의 코드는 등록할 수 없어요.')),
+          );
+        }
+        return;
+      }
+
+      // 대상의 기본 그룹이 /groups에 존재하는지 확인하고 없으면 자동 생성 후 멤버 추가
+      final groupDoc = await FirebaseFirestore.instance.collection('groups').doc(targetGroupId).get();
+      if (!groupDoc.exists) {
+        await FirebaseFirestore.instance.collection('groups').doc(targetGroupId).set({
+          'id': targetGroupId,
+          'name': '$targetName 님의 그룹',
+          'inviteCode': code,
+          'members': [targetUserDoc.id, widget.user.uid],
+          'createdBy': targetUserDoc.id,
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+      } else {
+        await FirebaseFirestore.instance.collection('groups').doc(targetGroupId).update({
+          'members': FieldValue.arrayUnion([widget.user.uid])
+        });
+      }
+
+      await FirebaseFirestore.instance.collection('users').doc(widget.user.uid).update({
+        'activeGroupId': targetGroupId,
+        'groupId': targetGroupId,
+      });
+
+      if (mounted) {
+        _inviteCodeController.clear();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('$targetName 님 그룹에 성공적으로 합류했어요!'),
+            backgroundColor: Theme.of(context).colorScheme.secondary,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('그룹 참여 실패: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('참여 중 에러가 발생했어요: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isRegistering = false);
+      }
+    }
+  }
+
+  // 신규 그룹 생성 비즈니스 로직
+  Future<void> _createGroup(String groupName) async {
+    if (groupName.trim().isEmpty) return;
+    
+    setState(() => _isRegistering = true);
+    try {
+      final String newGroupId = FirebaseFirestore.instance.collection('groups').doc().id;
+      final String code = _generateInviteCode();
+      
+      await FirebaseFirestore.instance.collection('groups').doc(newGroupId).set({
+        'id': newGroupId,
+        'name': groupName.trim(),
+        'inviteCode': code,
+        'members': [widget.user.uid],
+        'createdBy': widget.user.uid,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      await FirebaseFirestore.instance.collection('users').doc(widget.user.uid).update({
+        'activeGroupId': newGroupId,
+        'groupId': newGroupId,
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('[$groupName] 그룹을 만들었어요!'),
+            backgroundColor: Theme.of(context).colorScheme.secondary,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('그룹 생성 실패: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _isRegistering = false);
+      }
+    }
+  }
+
+  // 그룹 나가기 비즈니스 로직
+  Future<void> _leaveGroup(String groupId, String groupName) async {
+    try {
+      // 1. 그룹 멤버 목록에서 나 삭제
+      await FirebaseFirestore.instance.collection('groups').doc(groupId).update({
+        'members': FieldValue.arrayRemove([widget.user.uid])
+      });
+
+      // 2. 다른 소속 그룹 찾기
+      final myGroupsQuery = await FirebaseFirestore.instance
+          .collection('groups')
+          .where('members', arrayContains: widget.user.uid)
+          .limit(1)
+          .get();
+
+      String nextGroupId;
+      if (myGroupsQuery.docs.isNotEmpty) {
+        nextGroupId = myGroupsQuery.docs.first.id;
+      } else {
+        // 소속된 다른 그룹이 없으면 기본 개인 그룹 자동 재생성
+        nextGroupId = widget.user.uid;
+        final String newCode = _generateInviteCode();
+        await FirebaseFirestore.instance.collection('groups').doc(nextGroupId).set({
+          'id': nextGroupId,
+          'name': '기본 그룹',
+          'inviteCode': newCode,
+          'members': [widget.user.uid],
+          'createdBy': widget.user.uid,
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+        await FirebaseFirestore.instance.collection('users').doc(widget.user.uid).update({
+          'inviteCode': newCode,
+        });
+      }
+
+      await FirebaseFirestore.instance.collection('users').doc(widget.user.uid).update({
+        'activeGroupId': nextGroupId,
+        'groupId': nextGroupId,
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('[$groupName] 그룹에서 나왔습니다.')),
+        );
+      }
+    } catch (e) {
+      debugPrint('그룹 탈퇴 실패: $e');
+    }
+  }
+
+  // 그룹 이름 변경 비즈니스 로직
+  Future<void> _renameGroup(String groupId, String newName) async {
+    if (newName.trim().isEmpty) return;
+    try {
+      await FirebaseFirestore.instance.collection('groups').doc(groupId).update({
+        'name': newName.trim(),
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('그룹 이름을 변경했어요.')),
+        );
+      }
+    } catch (e) {
+      debugPrint('그룹 이름 변경 실패: $e');
+    }
+  }
+    final String initial = name.isNotEmpty ? name[0].toUpperCase() : '?';
+    final bool hasPhoto = photoUrl != null && photoUrl.isNotEmpty;
+
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Material(
+        color: Colors.transparent,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            // 원형 프로필 사진 (흰 테두리 + 파란 외곽선 + 그림자)
+            Container(
+              width: 58,
+              height: 58,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white, width: 3),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.30),
+                    blurRadius: 10,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+                color: tossBlue,
+                image: hasPhoto
+                    ? DecorationImage(
+                        image: NetworkImage(photoUrl!),
+                        fit: BoxFit.cover,
+                      )
+                    : null,
+              ),
+              child: hasPhoto
+                  ? null
+                  : Center(
+                      child: Text(
+                        initial,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+            ),
+            // 삼각형 포인터
+            CustomPaint(
+              size: const Size(14, 7),
+              painter: _TrianglePainter(color: tossBlue),
+            ),
+            // 이름 배지
+            Container(
+              constraints: const BoxConstraints(maxWidth: 90),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: tossBlue,
+                borderRadius: BorderRadius.circular(10),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.20),
+                    blurRadius: 4,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Text(
+                name,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  decoration: TextDecoration.none,
+                ),
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // 프로필 마커 아이콘 생성 (이미지 선 로드 후 NOverlayImage 변환)
+  Future<NOverlayImage?> _buildProfileMarkerIcon(String name, String? photoUrl) async {
+    if (!mounted) return null;
+
+    // 프로필 사진 선 로드 (NetworkImage 캐시 활용)
+    if (photoUrl != null && photoUrl.isNotEmpty) {
+      try {
+        await precacheImage(NetworkImage(photoUrl), context);
+      } catch (e) {
+        debugPrint('프로필 이미지 선 로드 실패: $e');
+      }
+    }
+
+    if (!mounted) return null;
+    try {
+      return await NOverlayImage.fromWidget(
+        widget: _buildMarkerWidget(name, photoUrl),
+        size: const Size(100, 96),
+        context: context,
+      );
+    } catch (e) {
+      debugPrint('마커 아이콘 생성 실패: $e');
+      return null;
+    }
+  }
+
+  // 지도 위에 오버레이(안심존 원형 구역 및 유저 마커) 업데이트
+  Future<void> _updateMapOverlays(List<dynamic> safeZones, List<DocumentSnapshot> familyDocs) async {
+    if (_mapController == null) return;
+    if (_isUpdatingOverlays) return; // 이미 실행 중이면 건너뜀
+    _isUpdatingOverlays = true;
+    _mapController!.clearOverlays();
+
+    // 1. 등록된 모든 안심존에 반경 100m 투명 원형 오버레이 그리기
+    for (var zone in safeZones) {
+      final circle = NCircleOverlay(
+        id: zone['id'].toString(),
+        center: NLatLng(zone['latitude'], zone['longitude']),
+        radius: zone['radius'] ?? 100.0,
+        color: tossBlue.withValues(alpha: 0.13),
+        outlineColor: tossBlue,
+        outlineWidth: 2,
+      );
+      _mapController!.addOverlay(circle);
+    }
+
+    // 2. 가족 구성원 실시간 위치 마커 (프로필 사진 마커)
+    for (var doc in familyDocs) {
+      final member = doc.data() as Map<String, dynamic>;
+      final double? lat = member['latitude'];
+      final double? lng = member['longitude'];
+      final String name = member['name'] ?? '알 수 없음';
+      final String? photoUrl = (member['photoUrl'] as String?)?.isNotEmpty == true
+          ? member['photoUrl'] as String
+          : null;
+
+      if (lat != null && lng != null) {
+        // 프로필 사진 마커 아이콘 생성
+        final markerIcon = await _buildProfileMarkerIcon(name, photoUrl);
+
+        // 생성자에 직접 전달 (addOverlay 이전에 setter 호출 불가)
+        final marker = markerIcon != null
+          ? NMarker(
+              id: doc.id,
+              position: NLatLng(lat, lng),
+              icon: markerIcon,
+              size: const Size(100, 96),
+              anchor: const NPoint(0.5, 1.0),
+            )
+          : NMarker(
+              id: doc.id,
+              position: NLatLng(lat, lng),
+              caption: NOverlayCaption(
+                text: name, textSize: 13,
+                color: tossBlue, haloColor: Colors.white,
+              ),
+            );
+
+        _mapController!.addOverlay(marker);
+      }
+    }
+    _isUpdatingOverlays = false; // guard 해제
+  }
+
+
+  // 내 위치로 지도 카메라 이동 및 줌 설정
+  Future<void> _centerOnMyLocation() async {
+    if (_mapController == null) return;
+    try {
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      await _mapController!.updateCamera(
+        NCameraUpdate.withParams(
+          target: NLatLng(position.latitude, position.longitude),
+          zoom: 15,
+        ),
+      );
+    } catch (e) {
+      debugPrint('내 위치 가져오기 실패: $e');
+    }
+  }
+
+  void _showGroupSelector(List<DocumentSnapshot> myGroups, String activeGroupId) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: cardBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: EdgeInsets.only(
+            left: 20,
+            right: 20,
+            top: 16,
+            bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4.5,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              const Text(
+                '참여 중인 그룹 리스트',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: textPrimary,
+                ),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                '대화방을 바꾸는 것처럼 원하는 그룹을 선택하여\n가족과 친구들의 실시간 위치를 확인할 수 있어요.',
+                style: TextStyle(fontSize: 12, color: textSecondary, height: 1.4),
+              ),
+              const Divider(height: 32, color: Colors.white10),
+              
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(context).size.height * 0.4,
+                ),
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: myGroups.length,
+                  separatorBuilder: (context, index) => const SizedBox(height: 10),
+                  itemBuilder: (context, index) {
+                    final groupDoc = myGroups[index];
+                    final groupData = groupDoc.data() as Map<String, dynamic>;
+                    final String groupId = groupDoc.id;
+                    final String groupName = groupData['name'] ?? '그룹';
+                    final List<dynamic> members = groupData['members'] ?? [];
+                    final bool isActive = (groupId == activeGroupId);
+
+                    return TossBounce(
+                      onTap: () async {
+                        Navigator.pop(context);
+                        await FirebaseFirestore.instance
+                            .collection('users')
+                            .doc(widget.user.uid)
+                            .update({
+                              'activeGroupId': groupId,
+                              'groupId': groupId,
+                            });
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                        decoration: BoxDecoration(
+                          color: isActive ? tossBlue.withValues(alpha: 0.12) : appBg.withValues(alpha: 0.6),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: isActive ? tossBlue.withValues(alpha: 0.5) : Colors.white.withValues(alpha: 0.05),
+                            width: 1.5,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    groupName,
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 15,
+                                      color: isActive ? tossBlue : textPrimary,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    '참여 멤버 ${members.length}명 • 초대 코드: ${groupData['inviteCode'] ?? ''}',
+                                    style: const TextStyle(fontSize: 11, color: textSecondary),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Row(
+                              children: [
+                                if (isActive)
+                                  const Icon(Icons.check_circle, color: tossBlue, size: 20)
+                                else
+                                  const SizedBox(width: 20),
+                                const SizedBox(width: 8),
+                                IconButton(
+                                  icon: const Icon(Icons.settings_outlined, color: textSecondary, size: 20),
+                                  onPressed: () {
+                                    Navigator.pop(context);
+                                    _showGroupSettings(groupId, groupName, groupData['inviteCode'] ?? '', groupData['createdBy'] ?? '');
+                                  },
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 20),
+              
+              Row(
+                children: [
+                  Expanded(
+                    child: TossBounce(
+                      onTap: () {
+                        Navigator.pop(context);
+                        _showCreateGroupDialog();
+                      },
+                      child: Container(
+                        height: 50,
+                        decoration: BoxDecoration(
+                          color: tossBlue.withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: tossBlue.withValues(alpha: 0.2)),
+                        ),
+                        child: const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.add, color: tossBlue, size: 18),
+                            SizedBox(width: 6),
+                            Text(
+                              '그룹 만들기',
+                              style: TextStyle(color: tossBlue, fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TossBounce(
+                      onTap: () {
+                        Navigator.pop(context);
+                        _showJoinGroupDialog();
+                      },
+                      child: Container(
+                        height: 50,
+                        decoration: BoxDecoration(
+                          color: appleGray,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
+                        ),
+                        child: const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.vpn_key_outlined, color: Colors.white70, size: 16),
+                            SizedBox(width: 6),
+                            Text(
+                              '코드로 참여',
+                              style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _showCreateGroupDialog() {
+    final TextEditingController controller = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: cardBg,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          title: const Text('새 그룹 만들기', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('가족이나 친구들과 공유할 그룹의 이름을 지어주세요.', style: TextStyle(color: textSecondary, fontSize: 13)),
+              const SizedBox(height: 16),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                decoration: InputDecoration(
+                  hintText: '예: 대학교 동창, 우리 가족',
+                  hintStyle: const TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                  filled: true,
+                  fillColor: appBg,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('취소', style: TextStyle(color: textSecondary)),
+            ),
+            TossBounce(
+              onTap: () {
+                final name = controller.text.trim();
+                if (name.isNotEmpty) {
+                  Navigator.pop(context);
+                  _createGroup(name);
+                }
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(color: tossBlue, borderRadius: BorderRadius.circular(12)),
+                child: const Text('생성', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _showJoinGroupDialog() {
+    final TextEditingController controller = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: cardBg,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          title: const Text('초대 코드로 그룹 참여', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('전달받은 6자리 초대 코드를 입력해 주세요.', style: TextStyle(color: textSecondary, fontSize: 13)),
+              const SizedBox(height: 16),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                textCapitalization: TextCapitalization.characters,
+                decoration: InputDecoration(
+                  hintText: '예: TRX89P',
+                  hintStyle: const TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                  filled: true,
+                  fillColor: appBg,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('취소', style: TextStyle(color: textSecondary)),
+            ),
+            TossBounce(
+              onTap: () {
+                final code = controller.text.trim().toUpperCase();
+                if (code.isNotEmpty) {
+                  Navigator.pop(context);
+                  _joinGroupWithCode(code);
+                }
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(color: tossBlue, borderRadius: BorderRadius.circular(12)),
+                child: const Text('참여', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _showGroupSettings(String groupId, String groupName, String inviteCode, String createdBy) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: cardBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4.5,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                '[$groupName] 설정',
+                style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: textPrimary),
+              ),
+              const Divider(height: 32, color: Colors.white10),
+              
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: appBg.withValues(alpha: 0.6),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('그룹 초대 코드', style: TextStyle(fontSize: 11, color: textSecondary)),
+                        const SizedBox(height: 2),
+                        Text(
+                          inviteCode,
+                          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: tossBlue, letterSpacing: 1.5),
+                        ),
+                      ],
+                    ),
+                    TossBounce(
+                      onTap: () {
+                        Navigator.pop(context);
+                        _copyToClipboard(inviteCode);
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                        decoration: BoxDecoration(color: tossBlue, borderRadius: BorderRadius.circular(12)),
+                        child: const Text('코드 복사', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              
+              ListTile(
+                leading: const Icon(Icons.edit_outlined, color: textPrimary),
+                title: const Text('그룹 이름 변경', style: TextStyle(color: textPrimary, fontSize: 14)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showRenameGroupDialog(groupId, groupName);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.exit_to_app_outlined, color: Colors.redAccent),
+                title: const Text('그룹 나가기', style: TextStyle(color: Colors.redAccent, fontSize: 14)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showLeaveConfirmDialog(groupId, groupName);
+                },
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _showRenameGroupDialog(String groupId, String oldName) {
+    final TextEditingController controller = TextEditingController(text: oldName);
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: cardBg,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          title: const Text('그룹 이름 변경', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: InputDecoration(
+              filled: true,
+              fillColor: appBg,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('취소', style: TextStyle(color: textSecondary)),
+            ),
+            TossBounce(
+              onTap: () {
+                final name = controller.text.trim();
+                if (name.isNotEmpty) {
+                  Navigator.pop(context);
+                  _renameGroup(groupId, name);
+                }
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(color: tossBlue, borderRadius: BorderRadius.circular(12)),
+                child: const Text('변경', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _showLeaveConfirmDialog(String groupId, String groupName) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: cardBg,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          title: const Text('그룹 나가기', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Colors.redAccent)),
+          content: Text('정말 [$groupName] 그룹에서 나가시겠어요?\n그룹에서 나가면 더 이상 서로의 실시간 위치를 공유할 수 없습니다.', style: const TextStyle(color: textSecondary, fontSize: 13, height: 1.4)),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('취소', style: TextStyle(color: textSecondary)),
+            ),
+            TossBounce(
+              onTap: () {
+                Navigator.pop(context);
+                _leaveGroup(groupId, groupName);
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(color: Colors.redAccent, borderRadius: BorderRadius.circular(12)),
+                child: const Text('나가기', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // 안심존 설정 패널 - 목록만 표시, 추가는 지도 위 플로팅 패널로
+  void _showSafeZoneSettings(List<dynamic> safeZones) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: cardBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: EdgeInsets.only(
+            left: 20, right: 20, top: 16,
+            bottom: MediaQuery.of(context).viewPadding.bottom + 24,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40, height: 4.5,
+                  decoration: BoxDecoration(color: appleGray, borderRadius: BorderRadius.circular(3)),
+                ),
+              ),
+              const SizedBox(height: 20),
+              const Text('안심존 관리하기',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: textPrimary)),
+              const SizedBox(height: 6),
+              const Text('안심존 반경 100m 내에서는 배터리 절약을 위해 위치 수집을 멈춰요.',
+                style: TextStyle(fontSize: 12, color: textSecondary, height: 1.4)),
+              const Divider(height: 32, color: Color(0xFFE5E8EB)),
+
+              if (safeZones.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24.0),
+                  child: Center(
+                    child: Text('등록된 안심존이 없습니다.\n아래 버튼으로 추가해보세요.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: textSecondary, fontSize: 13, height: 1.5)),
+                  ),
+                )
+              else
+                ListView.separated(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: safeZones.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  itemBuilder: (context, index) {
+                    final zone = safeZones[index];
+                    return Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      decoration: BoxDecoration(color: appBg, borderRadius: BorderRadius.circular(16)),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
+                            children: [
+                              const Icon(Icons.home_work_outlined, color: tossBlue, size: 20),
+                              const SizedBox(width: 12),
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(zone['name'] ?? '이름 없음',
+                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: textPrimary)),
+                                  Text('반경 ${(zone['radius'] ?? 100).toInt()}m',
+                                    style: const TextStyle(fontSize: 11, color: textSecondary)),
+                                ],
+                              ),
+                            ],
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 20),
+                            onPressed: () { _deleteSafeZone(zone); Navigator.pop(context); },
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+
+              const SizedBox(height: 20),
+              TossBounce(
+                onTap: () {
+                  Navigator.pop(context);
+                  Future.microtask(() => _showAddSafeZoneSheet());
+                },
+                child: Container(
+                  width: double.infinity, height: 52,
+                  decoration: BoxDecoration(color: tossBlue, borderRadius: BorderRadius.circular(16)),
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.add_location_alt, color: Colors.white, size: 20),
+                      SizedBox(width: 8),
+                      Text('새로운 안심존 추가하기',
+                        style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 15)),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // Uber 즐겨찾기 스타일 - 안심존 추가 시트 (StatefulBuilder 자체 완결)
+  void _showAddSafeZoneSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: cardBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (ctx) {
+        // 시트 전용 로컬 상태 (StatefulBuilder)
+        String zoneName = '';
+        String searchQuery = '';
+        List<dynamic> results = [];
+        bool isSearching = false;
+        double? selLat;
+        double? selLng;
+        String selAddress = '';
+
+        return StatefulBuilder(
+          builder: (ctx, setSheet) {
+
+            Future<void> doSearch(String q) async {
+              if (q.trim().isEmpty) return;
+              setSheet(() { isSearching = true; results = []; });
+              try {
+                final client = HttpClient();
+                client.connectionTimeout = const Duration(seconds: 10);
+                final url = Uri.parse(
+                  'https://nominatim.openstreetmap.org/search'
+                  '?q=${Uri.encodeComponent(q)}'
+                  '&format=json&limit=6&accept-language=ko&countrycodes=kr'
+                );
+                final req = await client.getUrl(url);
+                req.headers.set(HttpHeaders.userAgentHeader, 'GuardianApp/1.0');
+                final res = await req.close().timeout(const Duration(seconds: 10));
+                if (res.statusCode == 200) {
+                  final body = await res.transform(utf8.decoder).join();
+                  setSheet(() => results = json.decode(body));
+                }
+              } catch (e) {
+                debugPrint('장소 검색 오류: $e');
+              } finally {
+                setSheet(() => isSearching = false);
+              }
+            }
+
+            Future<void> doRegister() async {
+              if (zoneName.trim().isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('안심존 이름을 입력해주세요')));
+                return;
+              }
+              if (selLat == null) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('장소를 검색하고 선택해주세요')));
+                return;
+              }
+              final zoneId = DateTime.now().millisecondsSinceEpoch.toString();
+              try {
+                await FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(widget.user.uid)
+                  .update({'safeZones': FieldValue.arrayUnion([{
+                    'id': zoneId, 'name': zoneName.trim(),
+                    'latitude': selLat, 'longitude': selLng, 'radius': 100.0,
+                  }])});
+                if (ctx.mounted) {
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text('안심존 [${zoneName.trim()}] 추가 완료!'),
+                    backgroundColor: tossBlue,
+                  ));
+                }
+              } catch (e) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('저장 실패: $e'), backgroundColor: tossRed));
+              }
+            }
+
+            return Padding(
+              padding: EdgeInsets.only(
+                bottom: MediaQuery.of(ctx).viewInsets.bottom,
+              ),
+              child: DraggableScrollableSheet(
+                initialChildSize: 0.75,
+                minChildSize: 0.5,
+                maxChildSize: 0.95,
+                expand: false,
+                builder: (_, scrollController) => Column(
+                  children: [
+                    // 핸들 + 헤더
+                    Container(
+                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+                      child: Column(
+                        children: [
+                          Center(child: Container(width: 40, height: 4,
+                            decoration: BoxDecoration(color: appleGray, borderRadius: BorderRadius.circular(3)))),
+                          const SizedBox(height: 16),
+                          Row(children: [
+                            Container(
+                              width: 38, height: 38,
+                              decoration: BoxDecoration(color: tossBlue.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(11)),
+                              child: const Icon(Icons.add_location_alt, color: tossBlue, size: 20),
+                            ),
+                            const SizedBox(width: 12),
+                            const Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text('새 안심존 추가', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: textPrimary)),
+                                Text('장소를 검색하고 이름을 지정하세요', style: TextStyle(fontSize: 12, color: textSecondary)),
+                              ],
+                            ),
+                          ]),
+                          const SizedBox(height: 16),
+                          const Divider(color: appleGray, height: 1),
+                        ],
+                      ),
+                    ),
+
+                    // 스크롤 영역
+                    Expanded(
+                      child: ListView(
+                        controller: scrollController,
+                        padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                        children: [
+                          // 이름 입력
+                          const Text('안심존 이름', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textSecondary)),
+                          const SizedBox(height: 8),
+                          TextField(
+                            onChanged: (v) => setSheet(() => zoneName = v),
+                            decoration: InputDecoration(
+                              hintText: '예: 집, 회사, 학교',
+                              hintStyle: const TextStyle(color: textSecondary, fontSize: 14),
+                              filled: true, fillColor: appBg,
+                              prefixIcon: const Icon(Icons.label_outline, color: tossBlue, size: 20),
+                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+
+                          // 장소 검색
+                          const Text('장소 검색', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textSecondary)),
+                          const SizedBox(height: 8),
+                          Row(children: [
+                            Expanded(
+                              child: TextField(
+                                onChanged: (v) => setSheet(() => searchQuery = v),
+                                onSubmitted: doSearch,
+                                decoration: InputDecoration(
+                                  hintText: '주소 또는 장소명 검색',
+                                  hintStyle: const TextStyle(color: textSecondary, fontSize: 14),
+                                  filled: true, fillColor: appBg,
+                                  prefixIcon: const Icon(Icons.search, color: tossBlue, size: 20),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            TossBounce(
+                              onTap: () => doSearch(searchQuery),
+                              child: Container(
+                                width: 50, height: 50,
+                                decoration: BoxDecoration(color: tossBlue, borderRadius: BorderRadius.circular(14)),
+                                child: isSearching
+                                  ? const Padding(padding: EdgeInsets.all(14),
+                                      child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                                  : const Icon(Icons.search, color: Colors.white),
+                              ),
+                            ),
+                          ]),
+                          const SizedBox(height: 12),
+
+                          // 검색 결과
+                          if (results.isNotEmpty) ...[
+                            ...results.map((r) {
+                              final name = (r['display_name'] as String?) ?? '';
+                              final shortName = name.split(',')[0].trim();
+                              final lat = double.tryParse(r['lat']?.toString() ?? '');
+                              final lon = double.tryParse(r['lon']?.toString() ?? '');
+                              final isSelected = selLat == lat && selLng == lon;
+                              return GestureDetector(
+                                onTap: () => setSheet(() {
+                                  selLat = lat; selLng = lon; selAddress = name;
+                                  if (zoneName.isEmpty) zoneName = shortName;
+                                  results = [];
+                                }),
+                                child: Container(
+                                  margin: const EdgeInsets.only(bottom: 8),
+                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                                  decoration: BoxDecoration(
+                                    color: isSelected ? tossBlue.withValues(alpha: 0.08) : appBg,
+                                    borderRadius: BorderRadius.circular(14),
+                                    border: Border.all(
+                                      color: isSelected ? tossBlue : Colors.transparent, width: 1.5),
+                                  ),
+                                  child: Row(children: [
+                                    Icon(Icons.location_on_outlined,
+                                      color: isSelected ? tossBlue : textSecondary, size: 18),
+                                    const SizedBox(width: 12),
+                                    Expanded(child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(shortName, style: TextStyle(
+                                          fontWeight: FontWeight.w600, fontSize: 14,
+                                          color: isSelected ? tossBlue : textPrimary)),
+                                        Text(name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(fontSize: 11, color: textSecondary)),
+                                      ],
+                                    )),
+                                    if (isSelected) const Icon(Icons.check_circle, color: tossBlue, size: 18),
+                                  ]),
+                                ),
+                              );
+                            }),
+                          ],
+
+                          // 선택된 위치 확인 카드
+                          if (selLat != null) ...[
+                            Container(
+                              padding: const EdgeInsets.all(14),
+                              decoration: BoxDecoration(
+                                color: tossBlue.withValues(alpha: 0.07),
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(color: tossBlue.withValues(alpha: 0.3)),
+                              ),
+                              child: Row(children: [
+                                const Icon(Icons.check_circle, color: tossBlue, size: 20),
+                                const SizedBox(width: 10),
+                                Expanded(child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text('선택된 위치', style: TextStyle(fontSize: 11, color: tossBlue, fontWeight: FontWeight.w600)),
+                                    Text(selAddress.split(',')[0], style: const TextStyle(fontSize: 13, color: textPrimary, fontWeight: FontWeight.w500)),
+                                  ],
+                                )),
+                                TextButton(
+                                  onPressed: () => setSheet(() { selLat = null; selLng = null; selAddress = ''; }),
+                                  child: const Text('변경', style: TextStyle(color: tossBlue, fontSize: 12)),
+                                ),
+                              ]),
+                            ),
+                            const SizedBox(height: 16),
+                          ],
+                        ],
+                      ),
+                    ),
+
+                    // 등록 버튼
+                    Container(
+                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+                      decoration: const BoxDecoration(color: cardBg),
+                      child: TossBounce(
+                        onTap: doRegister,
+                        child: Container(
+                          width: double.infinity, height: 54,
+                          decoration: BoxDecoration(
+                            color: (zoneName.trim().isNotEmpty && selLat != null) ? tossBlue : appleGray,
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Center(child: Text(
+                            selLat != null ? '이 위치에 안심존 등록하기' : '장소를 검색하고 선택하세요',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 15,
+                              color: (zoneName.trim().isNotEmpty && selLat != null) ? Colors.white : textSecondary,
+                            ),
+                          )),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildBatteryBadge(int batteryLevel) {
+    IconData iconData;
+    Color color;
+
+    if (batteryLevel >= 85) {
+      iconData = Icons.battery_full;
+      color = const Color(0xFF2DFF9A);
+    } else if (batteryLevel >= 40) {
+      iconData = Icons.battery_3_bar;
+      color = const Color(0xFFF59E0B);
+    } else {
+      iconData = Icons.battery_alert;
+      color = Colors.redAccent;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(iconData, color: color, size: 14),
+          const SizedBox(width: 4),
+          Text(
+            '$batteryLevel%',
+            style: TextStyle(
+              color: color,
+              fontWeight: FontWeight.bold,
+              fontSize: 11,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final String currentUserId = widget.user.uid;
+
+    return StreamBuilder<DocumentSnapshot>(
+      stream: FirebaseFirestore.instance.collection('users').doc(currentUserId).snapshots(),
+      builder: (context, userSnapshot) {
+        if (userSnapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(
+              child: CircularProgressIndicator(color: tossBlue),
+            ),
+          );
+        }
+        if (!userSnapshot.hasData || userSnapshot.data?.data() == null) {
+          return const Scaffold(
+            body: Center(
+              child: Text('프로필을 가져오지 못했어요.'),
+            ),
+          );
+        }
+
+        final myData = userSnapshot.data!.data() as Map<String, dynamic>;
+        String myInviteCode = myData['inviteCode'] ?? '';
+        String myGroupId = myData['groupId'] ?? '';
+        String activeGroupId = myData['activeGroupId'] ?? '';
+        final List<dynamic> safeZones = myData['safeZones'] ?? [];
+
+        // 초대 코드가 없는 기존 사용자의 경우 자동으로 생성하여 Firestore에 업데이트합니다.
+        if (myInviteCode.isEmpty) {
+          final String newCode = _generateInviteCode();
+          myInviteCode = newCode;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            FirebaseFirestore.instance
+                .collection('users')
+                .doc(currentUserId)
+                .update({'inviteCode': newCode});
+          });
+        }
+
+        // 그룹 ID가 누락된 경우 자신의 UID로 자동 초기화합니다.
+        if (myGroupId.isEmpty) {
+          myGroupId = currentUserId;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            FirebaseFirestore.instance
+                .collection('users')
+                .doc(currentUserId)
+                .update({'groupId': currentUserId});
+          });
+        }
+
+        // 활성 그룹 ID가 누락된 경우 기본 그룹 ID로 설정합니다.
+        if (activeGroupId.isEmpty) {
+          activeGroupId = myGroupId;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            FirebaseFirestore.instance
+                .collection('users')
+                .doc(currentUserId)
+                .update({'activeGroupId': myGroupId});
+          });
+        }
+
+        final activeGroupDocRef = FirebaseFirestore.instance.collection('groups').doc(activeGroupId);
+
+        return StreamBuilder<DocumentSnapshot>(
+          stream: activeGroupDocRef.snapshots(),
+          builder: (context, groupSnapshot) {
+            if (groupSnapshot.connectionState == ConnectionState.waiting) {
+              return const Scaffold(
+                body: Center(
+                  child: CircularProgressIndicator(color: tossBlue),
+                ),
+              );
+            }
+
+            // 활성 그룹 문서가 존재하지 않는 경우, 마이그레이션(자동 생성) 실행
+            if (!groupSnapshot.hasData || !groupSnapshot.data!.exists) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                activeGroupDocRef.set({
+                  'id': activeGroupId,
+                  'name': '기본 그룹',
+                  'inviteCode': myInviteCode,
+                  'members': [currentUserId],
+                  'createdBy': currentUserId,
+                  'createdAt': FieldValue.serverTimestamp(),
+                }, SetOptions(merge: true));
+              });
+              return const Scaffold(
+                body: Center(
+                  child: CircularProgressIndicator(color: tossBlue),
+                ),
+              );
+            }
+
+            final groupData = groupSnapshot.data!.data() as Map<String, dynamic>;
+            final List<dynamic> members = groupData['members'] ?? [currentUserId];
+
+            final List<String> familyUids = members
+                .map((m) => m.toString())
+                .where((uid) => uid != currentUserId)
+                .toList();
+
+            // 가입 그룹 전체 목록 스트림
+            return StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('groups')
+                  .where('members', arrayContains: currentUserId)
+                  .snapshots(),
+              builder: (context, myGroupsSnapshot) {
+                final List<DocumentSnapshot> myGroups = myGroupsSnapshot.hasData ? myGroupsSnapshot.data!.docs : [];
+
+                if (familyUids.isEmpty) {
+                  return _buildHomeScreenContent(
+                    myData: myData,
+                    activeGroupId: activeGroupId,
+                    groupData: groupData,
+                    familyDocs: [],
+                    myGroups: myGroups,
+                    safeZones: safeZones,
+                    currentUserId: currentUserId,
+                  );
+                }
+
+                // 가족 멤버 목록 스트림
+                return StreamBuilder<QuerySnapshot>(
+                  stream: FirebaseFirestore.instance
+                      .collection('users')
+                      .where(FieldPath.documentId, whereIn: familyUids)
+                      .snapshots(),
+                  builder: (context, membersSnapshot) {
+                    final List<DocumentSnapshot> familyDocs = membersSnapshot.hasData ? membersSnapshot.data!.docs : [];
+                    
+                    // 지도에 실시간으로 오버레이 그려주기 (빌드 완료 후 실행)
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted) _updateMapOverlays(safeZones, familyDocs);
+                    });
+
+                    return _buildHomeScreenContent(
+                      myData: myData,
+                      activeGroupId: activeGroupId,
+                      groupData: groupData,
+                      familyDocs: familyDocs,
+                      myGroups: myGroups,
+                      safeZones: safeZones,
+                      currentUserId: currentUserId,
+                    );
+                  }
+                );
+              }
+            );
+          }
+        );
+      },
+    );
+  }
+
+  // 홈 화면 컨텐츠 빌드
+  Widget _buildHomeScreenContent({
+    required Map<String, dynamic> myData,
+    required String activeGroupId,
+    required Map<String, dynamic> groupData,
+    required List<DocumentSnapshot> familyDocs,
+    required List<DocumentSnapshot> myGroups,
+    required List<dynamic> safeZones,
+    required String currentUserId,
+  }) {
+    final String groupName = groupData['name'] ?? '기본 그룹';
+    final String groupInviteCode = groupData['inviteCode'] ?? '';
+
+    return Scaffold(
+      appBar: AppBar(
+        title: TossBounce(
+          onTap: () => _showGroupSelector(myGroups, activeGroupId),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                groupName,
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+              ),
+              const SizedBox(width: 4),
+              const Icon(Icons.keyboard_arrow_down, size: 20, color: textSecondary),
+            ],
+          ),
+        ),
+        centerTitle: false,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        actions: [
+          TossBounce(
+            onTap: () async {
+              FlutterBackgroundService().invoke('stopService');
+              await GoogleSignIn.instance.signOut();
+              await FirebaseAuth.instance.signOut();
+            },
+            child: Container(
+              margin: const EdgeInsets.only(right: 16, top: 12, bottom: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.redAccent.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Center(
+                child: Text(
+                  '로그아웃',
+                  style: TextStyle(
+                    color: Colors.redAccent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // 1. 그룹 초대 카드 정보
+            Container(
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(
+                color: cardBg,
+                borderRadius: BorderRadius.circular(24),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.04),
+                    blurRadius: 16,
+                    offset: const Offset(0, 8),
+                  ),
+                ],
+              ),
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        width: 48,
+                        height: 48,
+                        decoration: BoxDecoration(
+                          color: tossBlue.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: const Icon(Icons.group_outlined, size: 24, color: tossBlue),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              groupName,
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                color: textPrimary,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            const Text(
+                              '이 그룹에 가족과 친구들을 초대해 보세요.',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: textSecondary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: appBg.withValues(alpha: 0.6),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              '그룹 참여용 초대 코드',
+                              style: TextStyle(fontSize: 11, color: textSecondary),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              groupInviteCode,
+                              style: const TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 2.0,
+                                color: tossBlue,
+                              ),
+                            ),
+                          ],
+                        ),
+                        TossBounce(
+                          onTap: () => _copyToClipboard(groupInviteCode),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: tossBlue,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Text(
+                              '복사하기',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+
+            // 2. 함께 위치를 공유하는 사람들 목록
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  '함께 위치 나누는 멤버',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: textPrimary),
+                ),
+                TossBounce(
+                  onTap: () => _showSafeZoneSettings(safeZones),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: tossBlue.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Text(
+                      '🏡 안심존 관리',
+                      style: TextStyle(color: tossBlue, fontSize: 12, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+
+            if (familyDocs.isNotEmpty)
+              SizedBox(
+                height: 96,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  physics: const BouncingScrollPhysics(),
+                  itemCount: familyDocs.length,
+                  separatorBuilder: (context, index) => const SizedBox(width: 12),
+                  itemBuilder: (context, index) {
+                    final memberData = familyDocs[index].data() as Map<String, dynamic>;
+                    final String name = memberData['name'] ?? '가족';
+                    final String photoUrl = memberData['photoUrl'] ?? '';
+                    final int battery = memberData['battery'] ?? 100;
+                    final double? lat = memberData['latitude'];
+                    final double? lng = memberData['longitude'];
+
+                    return TossBounce(
+                      onTap: () {
+                        if (lat != null && lng != null && _mapController != null) {
+                          _mapController!.updateCamera(
+                            NCameraUpdate.withParams(
+                              target: NLatLng(lat, lng),
+                              zoom: 15,
+                            ),
+                          );
+                        }
+                      },
+                      child: Container(
+                        width: 160,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: cardBg,
+                          borderRadius: BorderRadius.circular(20),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.04),
+                              blurRadius: 12,
+                              offset: const Offset(0, 4),
+                            ),
+                          ],
+                        ),
+                      child: Row(
+                        children: [
+                          CircleAvatar(
+                            radius: 18,
+                            backgroundImage: photoUrl != '' ? NetworkImage(photoUrl) : null,
+                            child: photoUrl == '' ? const Icon(Icons.person, size: 18) : null,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Text(
+                                  name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                ),
+                                const SizedBox(height: 4),
+                                _buildBatteryBadge(battery),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+                ),
+              )
+            else
+              Row(
+                children: [
+                  Expanded(
+                    child: SizedBox(
+                      height: 48,
+                      child: TextField(
+                        controller: _inviteCodeController,
+                        textCapitalization: TextCapitalization.characters,
+                        style: const TextStyle(fontSize: 14),
+                        decoration: InputDecoration(
+                          hintText: '그룹 또는 가족의 초대 코드 6자리 입력',
+                          hintStyle: const TextStyle(color: Color(0xFF64748B), fontSize: 12),
+                          filled: true,
+                          fillColor: cardBg,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.05)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            borderSide: const BorderSide(color: tossBlue, width: 1.5),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TossBounce(
+                    onTap: _isRegistering ? null : () => _joinGroupWithCode(_inviteCodeController.text),
+                    child: Container(
+                      height: 48,
+                      width: 72,
+                      decoration: BoxDecoration(
+                        color: tossBlue,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Center(
+                        child: _isRegistering
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                              )
+                            : const Text('등록', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white)),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            
+            const SizedBox(height: 16),
+
+            // 3. 네이버 지도 영역
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(28),
+                child: Container(
+                  color: cardBg,
+                  child: Stack(
+                    children: [
+                      if (kIsWeb)
+                        Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              const Icon(Icons.map_outlined, color: textSecondary, size: 48),
+                              const SizedBox(height: 12),
+                              const Text(
+                                '지도는 모바일 기기(Android/iOS) 전용입니다.',
+                                style: TextStyle(color: textSecondary, fontSize: 13, fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 6),
+                              Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 24.0),
+                                child: Text(
+                                  '웹 버전에서는 지도 시각화가 제한되지만, 가족 등록 및 실시간 위치/배터리 정보 연동은 정상 동작합니다.',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(color: textSecondary.withValues(alpha: 0.6), fontSize: 11, height: 1.4),
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else
+                        NaverMap(
+                          options: const NaverMapViewOptions(
+                            indoorEnable: true,
+                            locationButtonEnable: false, // 커스텀 버튼 사용을 위해 false로 설정
+                            consumeSymbolTapEvents: false,
+                          ),
+                          onMapReady: (controller) async {
+                            _mapController = controller;
+                            
+                            // 권한 확인 후 위치 추적 모드를 활성화하여 내 위치 파란색 점 표시 및 follow 모드 진입
+                            final hasPermission = await Permission.location.isGranted;
+                            if (hasPermission) {
+                              controller.setLocationTrackingMode(NLocationTrackingMode.follow);
+                            }
+                            
+                            _updateMapOverlays(safeZones, familyDocs);
+                          },
+                        ),
+                      
+                      // 내 위치로 카메라 정렬하는 플로팅 버튼 (Toss Style)
+                      if (!kIsWeb)
+                        Positioned(
+                          bottom: 16,
+                          right: 16,
+                          child: TossBounce(
+                            onTap: _centerOnMyLocation,
+                            child: Container(
+                              width: 44,
+                              height: 44,
+                              decoration: BoxDecoration(
+                                color: cardBg,
+                                shape: BoxShape.circle,
+                                border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.25),
+                                    blurRadius: 8,
+                                    offset: const Offset(0, 4),
+                                  ),
+                                ],
+                              ),
+                              child: const Icon(
+                                Icons.my_location,
+                                color: tossBlue,
+                                size: 20,
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
+        ),
+      ),
+    );
+  }
+}
+// 마커 삼각형 포인터 CustomPainter
+class _TrianglePainter extends CustomPainter {
+  final Color color;
+  const _TrianglePainter({required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = color;
+    final path = Path()
+      ..moveTo(0, 0)
+      ..lineTo(size.width, 0)
+      ..lineTo(size.width / 2, size.height)
+      ..close();
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}

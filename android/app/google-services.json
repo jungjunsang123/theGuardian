@@ -1,0 +1,54 @@
+{
+  "project_info": {
+    "project_number": "246238512248",
+    "project_id": "the-guardian-794a5",
+    "storage_bucket": "the-guardian-794a5.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:246238512248:android:5f91adf33cf3725892998d",
+        "android_client_info": {
+          "package_name": "com.theguardian.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "246238512248-ma45eqoin16e0424itmt1ggkvn4h43db.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.theguardian.app",
+            "certificate_hash": "f3dcea1c9821659b011793e60de4fe83ee60a583"
+          }
+        },
+        {
+          "client_id": "246238512248-2foqjr7mkpifvkak6b8lsjhuq26j5us8.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyABOlkETQ7apMUhzxtbf8iPu9E80bLySj0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "246238512248-2foqjr7mkpifvkak6b8lsjhuq26j5us8.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "246238512248-vp1h6juavr0naacunbs8goboiiu1oplm.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.theguardian.app"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
