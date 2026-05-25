@@ -12,6 +12,8 @@ import 'package:geolocator/geolocator.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:battery_plus/battery_plus.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:image_picker/image_picker.dart';
 import 'dart:math';
 import 'dart:ui';
 
@@ -891,6 +893,464 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('그룹 이름 변경 실패: $e');
     }
   }
+
+  // 클립보드 복사 함수
+  void _copyToClipboard(String text) {
+    Clipboard.setData(ClipboardData(text: text));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('초대 코드가 클립보드에 복사되었습니다.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  // 안심존 삭제 함수
+  Future<void> _deleteSafeZone(Map<String, dynamic> zone) async {
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) return;
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .update({
+        'safeZones': FieldValue.arrayRemove([zone])
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('안심존 [${zone['name']}]을(를) 삭제했습니다.'),
+            backgroundColor: tossBlue,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('안심존 삭제 실패: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('안심존 삭제에 실패했습니다: $e'),
+            backgroundColor: tossRed,
+          ),
+        );
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------------
+  // 내 프로필 수정 기능 (닉네임 및 프로필 사진)
+  // -----------------------------------------------------------------------------
+  
+  // 프로필 수정 바텀 시트 열기
+  void _showProfileEditSheet() async {
+    final String uid = widget.user.uid;
+    
+    // Firestore에서 실시간 최신 정보 가져오기
+    DocumentSnapshot userDoc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
+    if (!userDoc.exists) return;
+    
+    final userData = userDoc.data() as Map<String, dynamic>;
+    String currentName = userData['name'] ?? '';
+    String currentPhotoUrl = userData['photoUrl'] ?? '';
+    
+    final nameController = TextEditingController(text: currentName);
+    String selectedPhotoUrl = currentPhotoUrl;
+    bool isSaving = false;
+    
+    if (!mounted) return;
+    
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: cardBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            final bool hasPhoto = selectedPhotoUrl.isNotEmpty;
+            
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 24,
+                right: 24,
+                top: 16,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  // 시트 손잡이
+                  Container(
+                    width: 40,
+                    height: 4.5,
+                    decoration: BoxDecoration(
+                      color: appleGray,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  const Text(
+                    '내 프로필 수정',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  
+                  // 프로필 사진 에디터 영역
+                  GestureDetector(
+                    onTap: () {
+                      _showPhotoSourceSelection(
+                        onPhotoSelected: (url) {
+                          setModalState(() {
+                            selectedPhotoUrl = url;
+                          });
+                        },
+                      );
+                    },
+                    child: Stack(
+                      alignment: Alignment.bottomRight,
+                      children: [
+                        Container(
+                          width: 100,
+                          height: 100,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(color: appleGray, width: 3),
+                            color: tossBlue.withOpacity(0.1),
+                            image: hasPhoto
+                                ? DecorationImage(
+                                    image: NetworkImage(selectedPhotoUrl),
+                                    fit: BoxFit.cover,
+                                  )
+                                : null,
+                          ),
+                          child: hasPhoto
+                              ? null
+                              : const Icon(
+                                  Icons.person,
+                                  size: 50,
+                                  color: tossBlue,
+                                ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.all(6),
+                          decoration: const BoxDecoration(
+                            color: tossBlue,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.camera_alt,
+                            size: 16,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  
+                  // 닉네임 라벨 & 입력
+                  const Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      '닉네임',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                        color: textSecondary,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: appBg,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: TextField(
+                      controller: nameController,
+                      maxLength: 10,
+                      decoration: const InputDecoration(
+                        border: InputBorder.none,
+                        counterText: '',
+                        hintText: '이름을 입력해주세요 (2~10자)',
+                        hintStyle: TextStyle(color: textSecondary),
+                      ),
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                        color: textPrimary,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 32),
+                  
+                  // 저장 버튼
+                  isSaving
+                      ? const Center(
+                          child: CircularProgressIndicator(color: tossBlue),
+                        )
+                      : TossBounce(
+                          onTap: () async {
+                            final newName = nameController.text.trim();
+                            if (newName.length < 2 || newName.length > 10) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('닉네임은 2자에서 10자 사이여야 합니다.'),
+                                  backgroundColor: tossRed,
+                                ),
+                              );
+                              return;
+                            }
+                            
+                            setModalState(() {
+                              isSaving = true;
+                            });
+                            
+                            bool success = await _updateProfile(newName, selectedPhotoUrl);
+                            
+                            if (mounted) {
+                              Navigator.pop(context);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    success
+                                        ? '프로필이 수정되었습니다.'
+                                        : '프로필 수정에 실패했습니다.',
+                                  ),
+                                  backgroundColor: success ? tossBlue : tossRed,
+                                ),
+                              );
+                            }
+                          },
+                          child: Container(
+                            width: double.infinity,
+                            height: 52,
+                            decoration: BoxDecoration(
+                              color: tossBlue,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: const Center(
+                              child: Text(
+                                '저장하기',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // 사진 수정 수단 선택 바텀시트
+  void _showPhotoSourceSelection({required Function(String url) onPhotoSelected}) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: cardBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.photo_library_outlined, color: tossBlue),
+                title: const Text('갤러리에서 사진 선택', style: TextStyle(fontWeight: FontWeight.bold, color: textPrimary)),
+                onTap: () async {
+                  Navigator.pop(context);
+                  String? uploadedUrl = await _pickAndUploadImage();
+                  if (uploadedUrl != null) {
+                    onPhotoSelected(uploadedUrl);
+                  }
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.face_outlined, color: tossBlue),
+                title: const Text('프리셋 캐릭터 선택', style: TextStyle(fontWeight: FontWeight.bold, color: textPrimary)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showPresetAvatarSelector(onPhotoSelected: onPhotoSelected);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.restart_alt, color: textSecondary),
+                title: const Text('기본 이미지로 변경', style: TextStyle(fontWeight: FontWeight.bold, color: textPrimary)),
+                onTap: () {
+                  Navigator.pop(context);
+                  onPhotoSelected('');
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // 프리셋 캐릭터 그리드 팝업
+  void _showPresetAvatarSelector({required Function(String url) onPhotoSelected}) {
+    final List<String> avatars = [
+      'https://api.dicebear.com/7.x/adventurer/png?seed=Felix',
+      'https://api.dicebear.com/7.x/adventurer/png?seed=Aneka',
+      'https://api.dicebear.com/7.x/adventurer/png?seed=Lilou',
+      'https://api.dicebear.com/7.x/adventurer/png?seed=Buster',
+      'https://api.dicebear.com/7.x/adventurer/png?seed=Jack',
+      'https://api.dicebear.com/7.x/adventurer/png?seed=Coco',
+    ];
+    
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: cardBg,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          title: const Text(
+            '프리셋 캐릭터 아바타 선택',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: textPrimary),
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: GridView.builder(
+              shrinkWrap: true,
+              itemCount: avatars.length,
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+              ),
+              itemBuilder: (context, index) {
+                final url = avatars[index];
+                return GestureDetector(
+                  onTap: () {
+                    onPhotoSelected(url);
+                    Navigator.pop(context);
+                  },
+                  child: Container(
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: appleGray, width: 2),
+                      image: DecorationImage(
+                        image: NetworkImage(url),
+                        fit: BoxFit.cover,
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('닫기', style: TextStyle(color: textSecondary, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // 갤러리 이미지 피커 및 Firebase Storage 업로드
+  Future<String?> _pickAndUploadImage() async {
+    final picker = ImagePicker();
+    try {
+      final XFile? image = await picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 500,
+        maxHeight: 500,
+        imageQuality: 85,
+      );
+      
+      if (image == null) return null;
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('프로필 이미지를 업로드 중입니다...'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+      
+      final File file = File(image.path);
+      final String uid = widget.user.uid;
+      
+      // Firebase Storage 업로드 시작
+      final storageRef = FirebaseStorage.instance
+          .ref()
+          .child('profiles')
+          .child('$uid.jpg');
+          
+      UploadTask uploadTask = storageRef.putFile(file);
+      TaskSnapshot snapshot = await uploadTask;
+      
+      String downloadUrl = await snapshot.ref.getDownloadURL();
+      return downloadUrl;
+    } catch (e) {
+      debugPrint('이미지 업로드 실패: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('이미지 선택 또는 업로드에 실패했습니다: $e'),
+            backgroundColor: tossRed,
+          ),
+        );
+      }
+      return null;
+    }
+  }
+
+  // Firestore 사용자 문서 업데이트
+  Future<bool> _updateProfile(String name, String photoUrl) async {
+    try {
+      final String uid = widget.user.uid;
+      
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(uid)
+          .update({
+        'name': name,
+        'photoUrl': photoUrl,
+      });
+      
+      final currentUser = FirebaseAuth.instance.currentUser;
+      if (currentUser != null) {
+        await currentUser.updateDisplayName(name);
+        if (photoUrl.isNotEmpty) {
+          await currentUser.updatePhotoURL(photoUrl);
+        }
+      }
+      return true;
+    } catch (e) {
+      debugPrint('프로필 업데이트 실패: $e');
+      return false;
+    }
+  }
+
+  // 프로필 마커 위젯 빌드 (원형 사진 + 이름 배지)
+  Widget _buildMarkerWidget(String name, String? photoUrl) {
     final String initial = name.isNotEmpty ? name[0].toUpperCase() : '?';
     final bool hasPhoto = photoUrl != null && photoUrl.isNotEmpty;
 
@@ -2175,6 +2635,28 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         actions: [
+          TossBounce(
+            onTap: () => _showProfileEditSheet(),
+            child: Container(
+              margin: const EdgeInsets.only(top: 12, bottom: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+              decoration: BoxDecoration(
+                color: tossBlue.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Center(
+                child: Text(
+                  '내 프로필',
+                  style: TextStyle(
+                    color: tossBlue,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
           TossBounce(
             onTap: () async {
               FlutterBackgroundService().invoke('stopService');
