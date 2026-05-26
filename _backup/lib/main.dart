@@ -2240,6 +2240,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // Uber 즐겨찾기 스타일 - 안심존 추가 시트 (StatefulBuilder 자체 완결)
   void _showAddSafeZoneSheet() {
     final searchController = TextEditingController();
+    final nameController = TextEditingController();
 
     showModalBottomSheet(
       context: context,
@@ -2251,7 +2252,6 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       builder: (ctx) {
         // 시트 전용 로컬 상태 (StatefulBuilder)
-        String zoneName = '';
         List<dynamic> results = [];
         bool isSearching = false;
         double? selLat;
@@ -2262,26 +2262,40 @@ class _HomeScreenState extends State<HomeScreen> {
           builder: (ctx, setSheet) {
 
             Future<void> doSearch(String q) async {
-              if (q.trim().isEmpty) return;
+              final query = q.trim();
+              if (query.isEmpty) {
+                if (ctx.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('검색할 주소 또는 장소명을 입력해 주세요.')),
+                  );
+                }
+                return;
+              }
+              
               setSheet(() { isSearching = true; results = []; });
               try {
                 final client = HttpClient();
                 client.connectionTimeout = const Duration(seconds: 10);
+                
+                // 검색 정확도 향상을 위해 한국 지역 우선으로 쿼리를 튜닝
                 final url = Uri.parse(
                   'https://nominatim.openstreetmap.org/search'
-                  '?q=${Uri.encodeComponent(q)}'
+                  '?q=${Uri.encodeComponent(query)}'
                   '&format=json&limit=6&accept-language=ko&countrycodes=kr'
                 );
+                
                 final req = await client.getUrl(url);
                 req.headers.set(HttpHeaders.userAgentHeader, 'TheGuardianFamilySafetyApp/1.0 (basil@guardian.local)');
                 final res = await req.close().timeout(const Duration(seconds: 10));
+                
                 if (res.statusCode == 200) {
                   final body = await res.transform(utf8.decoder).join();
                   final decoded = json.decode(body) as List<dynamic>;
+                  
                   if (decoded.isEmpty) {
                     if (ctx.mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('검색 결과가 없습니다. 다른 검색어를 입력해 보세요.')),
+                        SnackBar(content: Text('"$query"에 대한 주소 검색 결과가 없습니다. 다시 시도해 주세요.')),
                       );
                     }
                   }
@@ -2289,7 +2303,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 } else {
                   if (ctx.mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('주소 검색 서버 오류가 발생했습니다. (코드: ${res.statusCode})')),
+                      SnackBar(content: Text('주소 검색 서버 응답 실패 (코드: ${res.statusCode})')),
                     );
                   }
                 }
@@ -2297,7 +2311,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 debugPrint('장소 검색 오류: $e');
                 if (ctx.mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('주소 검색에 실패했습니다. 네트워크 상태를 확인해 주세요. ($e)')),
+                    SnackBar(content: Text('주소 검색 중 오류가 발생했습니다: $e')),
                   );
                 }
               } finally {
@@ -2306,7 +2320,8 @@ class _HomeScreenState extends State<HomeScreen> {
             }
 
             Future<void> doRegister() async {
-              if (zoneName.trim().isEmpty) {
+              final finalZoneName = nameController.text.trim();
+              if (finalZoneName.isEmpty) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(content: Text('안심존 이름을 입력해주세요')));
                 return;
@@ -2322,13 +2337,13 @@ class _HomeScreenState extends State<HomeScreen> {
                   .collection('users')
                   .doc(widget.user.uid)
                   .update({'safeZones': FieldValue.arrayUnion([{
-                    'id': zoneId, 'name': zoneName.trim(),
+                    'id': zoneId, 'name': finalZoneName,
                     'latitude': selLat, 'longitude': selLng, 'radius': 100.0,
                   }])});
                 if (ctx.mounted) {
                   Navigator.pop(ctx);
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text('안심존 [${zoneName.trim()}] 추가 완료!'),
+                    content: Text('안심존 [$finalZoneName] 추가 완료!'),
                     backgroundColor: tossBlue,
                   ));
                 }
@@ -2388,7 +2403,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           const Text('안심존 이름', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textSecondary)),
                           const SizedBox(height: 8),
                           TextField(
-                            onChanged: (v) => setSheet(() => zoneName = v),
+                            controller: nameController,
                             decoration: InputDecoration(
                               hintText: '예: 집, 회사, 학교',
                               hintStyle: const TextStyle(color: textSecondary, fontSize: 14),
@@ -2444,7 +2459,9 @@ class _HomeScreenState extends State<HomeScreen> {
                               return GestureDetector(
                                 onTap: () => setSheet(() {
                                   selLat = lat; selLng = lon; selAddress = name;
-                                  if (zoneName.isEmpty) zoneName = shortName;
+                                  if (nameController.text.trim().isEmpty) {
+                                    nameController.text = shortName;
+                                  }
                                   results = [];
                                 }),
                                 child: Container(
