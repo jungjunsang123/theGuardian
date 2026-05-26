@@ -946,6 +946,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // 프로필 수정 바텀 시트 열기
   void _showProfileEditSheet() async {
     final String uid = widget.user.uid;
+    final double safeBottom = MediaQuery.of(context).padding.bottom;
     
     // Firestore에서 실시간 최신 정보 가져오기
     DocumentSnapshot userDoc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
@@ -979,7 +980,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 left: 24,
                 right: 24,
                 top: 16,
-                bottom: MediaQuery.of(context).viewInsets.bottom + 24 + MediaQuery.of(context).padding.bottom,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 24 + safeBottom,
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -1163,6 +1164,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // 사진 수정 수단 선택 바텀시트
   void _showPhotoSourceSelection({required Function(String url) onPhotoSelected}) {
+    final double safeBottom = MediaQuery.of(context).padding.bottom;
     showModalBottomSheet(
       context: context,
       backgroundColor: cardBg,
@@ -1173,7 +1175,7 @@ class _HomeScreenState extends State<HomeScreen> {
         return Container(
           padding: EdgeInsets.only(
             top: 20,
-            bottom: 20 + MediaQuery.of(context).padding.bottom,
+            bottom: 20 + safeBottom,
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -1558,6 +1560,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _showGroupSelector(List<DocumentSnapshot> myGroups, String activeGroupId) {
+    final double safeBottom = MediaQuery.of(context).padding.bottom;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -1572,7 +1575,7 @@ class _HomeScreenState extends State<HomeScreen> {
             left: 20,
             right: 20,
             top: 16,
-            bottom: MediaQuery.of(context).viewInsets.bottom + 24 + MediaQuery.of(context).padding.bottom,
+            bottom: MediaQuery.of(context).viewInsets.bottom + 24 + safeBottom,
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -1865,6 +1868,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _showGroupSettings(String groupId, String groupName, String inviteCode, String createdBy) {
+    final double safeBottom = MediaQuery.of(context).padding.bottom;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -1875,7 +1879,12 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       builder: (context) {
         return Container(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+          padding: EdgeInsets.only(
+            left: 20,
+            right: 20,
+            top: 16,
+            bottom: 16 + safeBottom,
+          ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -2127,6 +2136,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // 안심존 설정 패널 - 목록만 표시, 추가는 지도 위 플로팅 패널로
   void _showSafeZoneSettings(List<dynamic> safeZones) {
+    final double safeBottom = MediaQuery.of(context).padding.bottom;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -2139,7 +2149,7 @@ class _HomeScreenState extends State<HomeScreen> {
         return Container(
           padding: EdgeInsets.only(
             left: 20, right: 20, top: 16,
-            bottom: 24 + MediaQuery.of(context).padding.bottom,
+            bottom: 24 + safeBottom,
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -2241,6 +2251,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _showAddSafeZoneSheet() {
     final searchController = TextEditingController();
     final nameController = TextEditingController();
+    final double safeBottom = MediaQuery.of(context).padding.bottom;
 
     showModalBottomSheet(
       context: context,
@@ -2527,21 +2538,21 @@ class _HomeScreenState extends State<HomeScreen> {
 
                     // 등록 버튼
                     Container(
-                      padding: EdgeInsets.fromLTRB(20, 12, 20, 20 + MediaQuery.of(ctx).padding.bottom),
+                      padding: EdgeInsets.fromLTRB(20, 12, 20, 20 + safeBottom),
                       decoration: const BoxDecoration(color: cardBg),
                       child: TossBounce(
                         onTap: doRegister,
                         child: Container(
                           width: double.infinity, height: 54,
                           decoration: BoxDecoration(
-                            color: (zoneName.trim().isNotEmpty && selLat != null) ? tossBlue : appleGray,
+                            color: (nameController.text.trim().isNotEmpty && selLat != null) ? tossBlue : appleGray,
                             borderRadius: BorderRadius.circular(16),
                           ),
                           child: Center(child: Text(
                             selLat != null ? '이 위치에 안심존 등록하기' : '장소를 검색하고 선택하세요',
                             style: TextStyle(
                               fontWeight: FontWeight.bold, fontSize: 15,
-                              color: (zoneName.trim().isNotEmpty && selLat != null) ? Colors.white : textSecondary,
+                              color: (nameController.text.trim().isNotEmpty && selLat != null) ? Colors.white : textSecondary,
                             ),
                           )),
                         ),
@@ -2550,6 +2561,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
               ),
+            );
           },
         );
       },
@@ -2931,9 +2943,9 @@ class _HomeScreenState extends State<HomeScreen> {
                             child: const Text(
                               '복사하기',
                               style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.bold,
-                                color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.white,
                               ),
                             ),
                           ),
@@ -3203,7 +3215,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
-            const SizedBox(height: 16),
+            SizedBox(height: 16 + MediaQuery.of(context).padding.bottom),
           ],
         ),
       ),
