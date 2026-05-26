@@ -2550,13 +2550,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
               ),
-            );
           },
         );
       },
-    ).then((_) {
-      searchController.dispose();
-    });
+    );
   }
 
   Widget _buildBatteryBadge(int batteryLevel) {
