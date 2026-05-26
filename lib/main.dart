@@ -2272,8 +2272,36 @@ class _HomeScreenState extends State<HomeScreen> {
         return StatefulBuilder(
           builder: (ctx, setSheet) {
 
+            Future<String> reverseGeocode(double lat, double lng) async {
+              try {
+                final client = HttpClient();
+                client.connectionTimeout = const Duration(seconds: 5);
+                final url = Uri.parse(
+                  'https://nominatim.openstreetmap.org/reverse'
+                  '?lat=$lat&lon=$lng&format=json&accept-language=ko'
+                );
+                final req = await client.getUrl(url);
+                req.headers.set(HttpHeaders.userAgentHeader, 'TheGuardianFamilySafetyApp/1.0 (basil@guardian.local)');
+                final res = await req.close().timeout(const Duration(seconds: 5));
+                if (res.statusCode == 200) {
+                  final body = await res.transform(utf8.decoder).join();
+                  final decoded = json.decode(body) as Map<String, dynamic>;
+                  
+                  final String fullAddr = decoded['display_name'] ?? '';
+                  final parts = fullAddr.split(',');
+                  if (parts.isNotEmpty) {
+                    return parts[0].trim();
+                  }
+                  return fullAddr;
+                }
+              } catch (e) {
+                debugPrint('역지오코딩 오류: $e');
+              }
+              return '${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}';
+            }
+
             Future<void> doSearch(String q) async {
-              final query = q.trim();
+              String query = q.trim();
               if (query.isEmpty) {
                 if (ctx.mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -2281,6 +2309,12 @@ class _HomeScreenState extends State<HomeScreen> {
                   );
                 }
                 return;
+              }
+
+              // [VETERAN TOUCH] 도로명 주소 숫자가 띄어쓰기 없이 붙어있는 경우 자동 보정 (예: 여의대로56 -> 여의대로 56)
+              final match = RegExp(r'^([가-힣a-zA-Z\s]+)(\d+)$').firstMatch(query);
+              if (match != null) {
+                query = '${match.group(1)!.trim()} ${match.group(2)}';
               }
               
               setSheet(() { isSearching = true; results = []; });
@@ -2327,6 +2361,90 @@ class _HomeScreenState extends State<HomeScreen> {
                 }
               } finally {
                 setSheet(() => isSearching = false);
+              }
+            }
+
+            Future<void> selectCurrentLocation() async {
+              setSheet(() { isSearching = true; });
+              try {
+                final status = await Permission.location.status;
+                if (!status.isGranted) {
+                  await Permission.location.request();
+                }
+                
+                Position pos = await Geolocator.getCurrentPosition(
+                  desiredAccuracy: LocationAccuracy.high,
+                  timeLimit: const Duration(seconds: 4),
+                );
+                
+                final addr = await reverseGeocode(pos.latitude, pos.longitude);
+                setSheet(() {
+                  selLat = pos.latitude;
+                  selLng = pos.longitude;
+                  selAddress = addr;
+                  if (nameController.text.trim().isEmpty) {
+                    nameController.text = '내 위치';
+                  }
+                });
+              } catch (e) {
+                debugPrint('Geolocator 실패, Firestore 백업 사용: $e');
+                try {
+                  final userDoc = await FirebaseFirestore.instance.collection('users').doc(widget.user.uid).get();
+                  if (userDoc.exists && userDoc.data() != null) {
+                    final data = userDoc.data()!;
+                    final lat = data['latitude'] as double?;
+                    final lng = data['longitude'] as double?;
+                    if (lat != null && lng != null) {
+                      final addr = await reverseGeocode(lat, lng);
+                      setSheet(() {
+                        selLat = lat;
+                        selLng = lng;
+                        selAddress = addr;
+                        if (nameController.text.trim().isEmpty) {
+                          nameController.text = '내 위치';
+                        }
+                      });
+                      return;
+                    }
+                  }
+                } catch (dbErr) {
+                  debugPrint('Firestore 백업 읽기 실패: $dbErr');
+                }
+                
+                if (ctx.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('현재 위치를 가져오지 못했습니다. 위치 권한을 확인해 주세요.')),
+                  );
+                }
+              } finally {
+                setSheet(() { isSearching = false; });
+              }
+            }
+
+            Future<void> selectMapCenterLocation() async {
+              if (_mapController == null) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('지도가 아직 준비되지 않았습니다.')),
+                );
+                return;
+              }
+              
+              setSheet(() { isSearching = true; });
+              try {
+                final target = _mapController!.getCameraPosition().target;
+                final addr = await reverseGeocode(target.latitude, target.longitude);
+                setSheet(() {
+                  selLat = target.latitude;
+                  selLng = target.longitude;
+                  selAddress = addr;
+                  if (nameController.text.trim().isEmpty) {
+                    nameController.text = '지도 선택 위치';
+                  }
+                });
+              } catch (e) {
+                debugPrint('지도 중심 설정 에러: $e');
+              } finally {
+                setSheet(() { isSearching = false; });
               }
             }
 
@@ -2457,6 +2575,66 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                             ),
                           ]),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: TossBounce(
+                                  onTap: selectCurrentLocation,
+                                  child: Container(
+                                    height: 44,
+                                    decoration: BoxDecoration(
+                                      color: tossBlue.withOpacity(0.08),
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                    child: const Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Icon(Icons.my_location, color: tossBlue, size: 16),
+                                        SizedBox(width: 6),
+                                        Text(
+                                          '현재 위치 지정',
+                                          style: TextStyle(
+                                            color: tossBlue,
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: TossBounce(
+                                  onTap: selectMapCenterLocation,
+                                  child: Container(
+                                    height: 44,
+                                    decoration: BoxDecoration(
+                                      color: tossBlue.withOpacity(0.08),
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                    child: const Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Icon(Icons.filter_center_focus, color: tossBlue, size: 16),
+                                        SizedBox(width: 6),
+                                        Text(
+                                          '지도 중심 지정',
+                                          style: TextStyle(
+                                            color: tossBlue,
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
                           const SizedBox(height: 12),
 
                           // 검색 결과
