@@ -2409,7 +2409,8 @@ class _HomeScreenState extends State<HomeScreen> {
               
               setSheet(() { isSearching = true; });
               try {
-                final target = _mapController!.getCameraPosition().target;
+                final cameraPos = await _mapController!.getCameraPosition();
+                final target = cameraPos.target;
                 final addr = await reverseGeocode(target.latitude, target.longitude);
                 setSheet(() {
                   selLat = target.latitude;
