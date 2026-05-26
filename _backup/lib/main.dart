@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'dart:io';
 import 'dart:convert';
+import 'dart:async';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
@@ -2247,11 +2248,11 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // Uber 즐겨찾기 스타일 - 안심존 추가 시트 (StatefulBuilder 자체 완결)
   void _showAddSafeZoneSheet() {
     final searchController = TextEditingController();
     final nameController = TextEditingController();
     final double safeBottom = MediaQuery.of(context).padding.bottom;
+    Timer? debounceTimer;
 
     showModalBottomSheet(
       context: context,
@@ -2303,11 +2304,7 @@ class _HomeScreenState extends State<HomeScreen> {
             Future<void> doSearch(String q) async {
               String query = q.trim();
               if (query.isEmpty) {
-                if (ctx.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('검색할 주소 또는 장소명을 입력해 주세요.')),
-                  );
-                }
+                setSheet(() { results = []; });
                 return;
               }
 
@@ -2336,29 +2333,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 if (res.statusCode == 200) {
                   final body = await res.transform(utf8.decoder).join();
                   final decoded = json.decode(body) as List<dynamic>;
-                  
-                  if (decoded.isEmpty) {
-                    if (ctx.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('"$query"에 대한 주소 검색 결과가 없습니다. 다시 시도해 주세요.')),
-                      );
-                    }
-                  }
                   setSheet(() => results = decoded);
-                } else {
-                  if (ctx.mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('주소 검색 서버 응답 실패 (코드: ${res.statusCode})')),
-                    );
-                  }
                 }
               } catch (e) {
                 debugPrint('장소 검색 오류: $e');
-                if (ctx.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('주소 검색 중 오류가 발생했습니다: $e')),
-                  );
-                }
               } finally {
                 setSheet(() => isSearching = false);
               }
@@ -2493,10 +2471,15 @@ class _HomeScreenState extends State<HomeScreen> {
                 expand: false,
                 builder: (_, scrollController) => Column(
                   children: [
-                    // 핸들 + 헤더
+                    // 핸들 + 고정형 상단 헤더 & 검색창 (Pinned Top Header)
                     Container(
-                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+                      decoration: const BoxDecoration(
+                        color: cardBg,
+                        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+                      ),
                       child: Column(
+                        mainAxisSize: MainAxisSize.min,
                         children: [
                           Center(child: Container(width: 40, height: 4,
                             decoration: BoxDecoration(color: appleGray, borderRadius: BorderRadius.circular(3)))),
@@ -2512,77 +2495,56 @@ class _HomeScreenState extends State<HomeScreen> {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text('새 안심존 추가', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: textPrimary)),
-                                Text('장소를 검색하고 이름을 지정하세요', style: TextStyle(fontSize: 12, color: textSecondary)),
+                                Text('장소를 설정하고 이름을 등록하세요', style: TextStyle(fontSize: 12, color: textSecondary)),
                               ],
                             ),
                           ]),
                           const SizedBox(height: 16),
-                          const Divider(color: appleGray, height: 1),
-                        ],
-                      ),
-                    ),
-
-                    // 스크롤 영역
-                    Expanded(
-                      child: ListView(
-                        controller: scrollController,
-                        padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-                        children: [
-                          // 이름 입력
-                          const Text('안심존 이름', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textSecondary)),
-                          const SizedBox(height: 8),
+                          
+                          // 상단 고정 검색바 (Debounced Instant Autocomplete)
                           TextField(
-                            controller: nameController,
+                            controller: searchController,
+                            onChanged: (val) {
+                              if (debounceTimer?.isActive ?? false) debounceTimer!.cancel();
+                              debounceTimer = Timer(const Duration(milliseconds: 400), () {
+                                if (ctx.mounted) {
+                                  if (val.trim().isNotEmpty) {
+                                    doSearch(val);
+                                  } else {
+                                    setSheet(() { results = []; });
+                                  }
+                                }
+                              });
+                            },
+                            onSubmitted: doSearch,
                             decoration: InputDecoration(
-                              hintText: '예: 집, 회사, 학교',
-                              hintStyle: const TextStyle(color: textSecondary, fontSize: 14),
+                              hintText: '주소 또는 장소명 검색 (예: 여의대로56)',
+                              hintStyle: const TextStyle(color: textSecondary, fontSize: 13),
                               filled: true, fillColor: appBg,
-                              prefixIcon: const Icon(Icons.label_outline, color: tossBlue, size: 20),
+                              prefixIcon: const Icon(Icons.search, color: tossBlue, size: 20),
+                              suffixIcon: searchController.text.isNotEmpty 
+                                ? IconButton(
+                                    icon: const Icon(Icons.cancel, color: textSecondary, size: 18),
+                                    onPressed: () {
+                                      searchController.clear();
+                                      setSheet(() { results = []; });
+                                    },
+                                  )
+                                : null,
                               border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
-                              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                             ),
                           ),
-                          const SizedBox(height: 20),
-
-                          // 장소 검색
-                          const Text('장소 검색', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textSecondary)),
-                          const SizedBox(height: 8),
-                          Row(children: [
-                            Expanded(
-                              child: TextField(
-                                controller: searchController,
-                                onSubmitted: doSearch,
-                                decoration: InputDecoration(
-                                  hintText: '주소 또는 장소명 검색',
-                                  hintStyle: const TextStyle(color: textSecondary, fontSize: 14),
-                                  filled: true, fillColor: appBg,
-                                  prefixIcon: const Icon(Icons.search, color: tossBlue, size: 20),
-                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
-                                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            TossBounce(
-                              onTap: () => doSearch(searchController.text),
-                              child: Container(
-                                width: 50, height: 50,
-                                decoration: BoxDecoration(color: tossBlue, borderRadius: BorderRadius.circular(14)),
-                                child: isSearching
-                                  ? const Padding(padding: EdgeInsets.all(14),
-                                      child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                                  : const Icon(Icons.search, color: Colors.white),
-                              ),
-                            ),
-                          ]),
-                          const SizedBox(height: 12),
+                          const SizedBox(height: 10),
+                          
+                          // 상단 고정 2대 편의 퀵 단축 버튼
                           Row(
                             children: [
                               Expanded(
                                 child: TossBounce(
                                   onTap: selectCurrentLocation,
                                   child: Container(
-                                    height: 44,
+                                    height: 40,
                                     decoration: BoxDecoration(
                                       color: tossBlue.withOpacity(0.08),
                                       borderRadius: BorderRadius.circular(12),
@@ -2590,16 +2552,9 @@ class _HomeScreenState extends State<HomeScreen> {
                                     child: const Row(
                                       mainAxisAlignment: MainAxisAlignment.center,
                                       children: [
-                                        Icon(Icons.my_location, color: tossBlue, size: 16),
+                                        Icon(Icons.my_location, color: tossBlue, size: 14),
                                         SizedBox(width: 6),
-                                        Text(
-                                          '현재 위치 지정',
-                                          style: TextStyle(
-                                            color: tossBlue,
-                                            fontSize: 13,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        ),
+                                        Text('현재 위치 지정', style: TextStyle(color: tossBlue, fontSize: 12, fontWeight: FontWeight.bold)),
                                       ],
                                     ),
                                   ),
@@ -2610,7 +2565,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                 child: TossBounce(
                                   onTap: selectMapCenterLocation,
                                   child: Container(
-                                    height: 44,
+                                    height: 40,
                                     decoration: BoxDecoration(
                                       color: tossBlue.withOpacity(0.08),
                                       borderRadius: BorderRadius.circular(12),
@@ -2618,16 +2573,9 @@ class _HomeScreenState extends State<HomeScreen> {
                                     child: const Row(
                                       mainAxisAlignment: MainAxisAlignment.center,
                                       children: [
-                                        Icon(Icons.filter_center_focus, color: tossBlue, size: 16),
+                                        Icon(Icons.filter_center_focus, color: tossBlue, size: 14),
                                         SizedBox(width: 6),
-                                        Text(
-                                          '지도 중심 지정',
-                                          style: TextStyle(
-                                            color: tossBlue,
-                                            fontSize: 13,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        ),
+                                        Text('지도 중심 지정', style: TextStyle(color: tossBlue, fontSize: 12, fontWeight: FontWeight.bold)),
                                       ],
                                     ),
                                   ),
@@ -2635,107 +2583,181 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                             ],
                           ),
-                          const SizedBox(height: 12),
-
-                          // 검색 결과
-                          if (results.isNotEmpty) ...[
-                            ...results.map((r) {
-                              final name = (r['display_name'] as String?) ?? '';
-                              final shortName = name.split(',')[0].trim();
-                              final lat = double.tryParse(r['lat']?.toString() ?? '');
-                              final lon = double.tryParse(r['lon']?.toString() ?? '');
-                              final isSelected = selLat == lat && selLng == lon;
-                              return GestureDetector(
-                                onTap: () => setSheet(() {
-                                  selLat = lat; selLng = lon; selAddress = name;
-                                  if (nameController.text.trim().isEmpty) {
-                                    nameController.text = shortName;
-                                  }
-                                  results = [];
-                                }),
-                                child: Container(
-                                  margin: const EdgeInsets.only(bottom: 8),
-                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                                  decoration: BoxDecoration(
-                                    color: isSelected ? tossBlue.withValues(alpha: 0.08) : appBg,
-                                    borderRadius: BorderRadius.circular(14),
-                                    border: Border.all(
-                                      color: isSelected ? tossBlue : Colors.transparent, width: 1.5),
-                                  ),
-                                  child: Row(children: [
-                                    Icon(Icons.location_on_outlined,
-                                      color: isSelected ? tossBlue : textSecondary, size: 18),
-                                    const SizedBox(width: 12),
-                                    Expanded(child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(shortName, style: TextStyle(
-                                          fontWeight: FontWeight.w600, fontSize: 14,
-                                          color: isSelected ? tossBlue : textPrimary)),
-                                        Text(name, maxLines: 1, overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(fontSize: 11, color: textSecondary)),
-                                      ],
-                                    )),
-                                    if (isSelected) const Icon(Icons.check_circle, color: tossBlue, size: 18),
-                                  ]),
-                                ),
-                              );
-                            }),
-                          ],
-
-                          // 선택된 위치 확인 카드
-                          if (selLat != null) ...[
-                            Container(
-                              padding: const EdgeInsets.all(14),
-                              decoration: BoxDecoration(
-                                color: tossBlue.withValues(alpha: 0.07),
-                                borderRadius: BorderRadius.circular(14),
-                                border: Border.all(color: tossBlue.withValues(alpha: 0.3)),
-                              ),
-                              child: Row(children: [
-                                const Icon(Icons.check_circle, color: tossBlue, size: 20),
-                                const SizedBox(width: 10),
-                                Expanded(child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text('선택된 위치', style: TextStyle(fontSize: 11, color: tossBlue, fontWeight: FontWeight.w600)),
-                                    Text(selAddress.split(',')[0], style: const TextStyle(fontSize: 13, color: textPrimary, fontWeight: FontWeight.w500)),
-                                  ],
-                                )),
-                                TextButton(
-                                  onPressed: () => setSheet(() { selLat = null; selLng = null; selAddress = ''; }),
-                                  child: const Text('변경', style: TextStyle(color: tossBlue, fontSize: 12)),
-                                ),
-                              ]),
-                            ),
-                            const SizedBox(height: 16),
-                          ],
+                          const SizedBox(height: 10),
+                          const Divider(color: appleGray, height: 1),
                         ],
                       ),
                     ),
 
-                    // 등록 버튼
-                    Container(
-                      padding: EdgeInsets.fromLTRB(20, 12, 20, 20 + safeBottom),
-                      decoration: const BoxDecoration(color: cardBg),
-                      child: TossBounce(
-                        onTap: doRegister,
-                        child: Container(
-                          width: double.infinity, height: 54,
-                          decoration: BoxDecoration(
-                            color: (nameController.text.trim().isNotEmpty && selLat != null) ? tossBlue : appleGray,
-                            borderRadius: BorderRadius.circular(16),
+                    // 스크롤 영역 (실시간 띄워질 미리보기 검색 리스트)
+                    Expanded(
+                      child: isSearching
+                        ? const Center(child: CircularProgressIndicator(color: tossBlue))
+                        : ListView(
+                            controller: scrollController,
+                            padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+                            children: [
+                              if (results.isNotEmpty) ...[
+                                ...results.map((r) {
+                                  final name = (r['display_name'] as String?) ?? '';
+                                  final shortName = name.split(',')[0].trim();
+                                  final lat = double.tryParse(r['lat']?.toString() ?? '');
+                                  final lon = double.tryParse(r['lon']?.toString() ?? '');
+                                  final isSelected = selLat == lat && selLng == lon;
+                                  return GestureDetector(
+                                    onTap: () => setSheet(() {
+                                      selLat = lat; selLng = lon; selAddress = name;
+                                      if (nameController.text.trim().isEmpty) {
+                                        nameController.text = shortName;
+                                      }
+                                      results = [];
+                                      searchController.clear();
+                                    }),
+                                    child: Container(
+                                      margin: const EdgeInsets.only(bottom: 8),
+                                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                                      decoration: BoxDecoration(
+                                        color: isSelected ? tossBlue.withValues(alpha: 0.08) : appBg,
+                                        borderRadius: BorderRadius.circular(14),
+                                        border: Border.all(
+                                          color: isSelected ? tossBlue : Colors.transparent, width: 1.5),
+                                      ),
+                                      child: Row(children: [
+                                        Icon(Icons.location_on_outlined,
+                                          color: isSelected ? tossBlue : textSecondary, size: 18),
+                                        const SizedBox(width: 12),
+                                        Expanded(child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Text(shortName, style: TextStyle(
+                                              fontWeight: FontWeight.w600, fontSize: 14,
+                                              color: isSelected ? tossBlue : textPrimary)),
+                                            Text(name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(fontSize: 11, color: textSecondary)),
+                                          ],
+                                        )),
+                                        if (isSelected) const Icon(Icons.check_circle, color: tossBlue, size: 18),
+                                      ]),
+                                    ),
+                                  );
+                                }),
+                              ] else if (searchController.text.trim().isNotEmpty) ...[
+                                const Padding(
+                                  padding: EdgeInsets.symmetric(vertical: 40.0),
+                                  child: Center(
+                                    child: Column(
+                                      children: [
+                                        Icon(Icons.search_off_rounded, color: textSecondary, size: 40),
+                                        SizedBox(height: 12),
+                                        Text('검색 결과가 없습니다.', style: TextStyle(color: textSecondary, fontSize: 13)),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ] else ...[
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 40.0),
+                                  child: Center(
+                                    child: Column(
+                                      children: [
+                                        Icon(Icons.map_outlined, color: tossBlue.withOpacity(0.3), size: 48),
+                                        const SizedBox(height: 12),
+                                        const Text(
+                                          '위에서 장소를 검색하거나\n현재 위치 / 지도 중심 버튼을 눌러 지정해 보세요.',
+                                          textAlign: TextAlign.center,
+                                          style: TextStyle(color: textSecondary, fontSize: 13, height: 1.5),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
-                          child: Center(child: Text(
-                            selLat != null ? '이 위치에 안심존 등록하기' : '장소를 검색하고 선택하세요',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold, fontSize: 15,
-                              color: (nameController.text.trim().isNotEmpty && selLat != null) ? Colors.white : textSecondary,
+                    ),
+
+                    // 선택 완료 후 위젯 하단 슬라이딩 고정 카드 (Guided Slide-Up Footer)
+                    if (selLat != null)
+                      Container(
+                        padding: EdgeInsets.fromLTRB(20, 16, 20, 16 + safeBottom),
+                        decoration: BoxDecoration(
+                          color: cardBg,
+                          border: Border(top: BorderSide(color: appleGray.withOpacity(0.5), width: 1)),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.04),
+                              blurRadius: 10,
+                              offset: const Offset(0, -4),
                             ),
-                          )),
+                          ],
+                        ),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: tossBlue.withOpacity(0.06),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.check_circle_rounded, color: tossBlue, size: 16),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      '선택된 장소: ${selAddress.split(',')[0]}',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: tossBlue),
+                                    ),
+                                  ),
+                                  GestureDetector(
+                                    onTap: () => setSheet(() { selLat = null; selLng = null; selAddress = ''; nameController.clear(); }),
+                                    child: const Text('초기화', style: TextStyle(color: tossRed, fontSize: 12, fontWeight: FontWeight.bold)),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            const Text('안심존 이름 지정', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: textSecondary)),
+                            const SizedBox(height: 6),
+                            TextField(
+                              controller: nameController,
+                              onChanged: (val) {
+                                setSheet(() {});
+                              },
+                              decoration: InputDecoration(
+                                hintText: '예: 집, 회사, 학교',
+                                hintStyle: const TextStyle(color: textSecondary, fontSize: 13),
+                                filled: true, fillColor: appBg,
+                                prefixIcon: const Icon(Icons.label_outline, color: tossBlue, size: 18),
+                                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            TossBounce(
+                              onTap: doRegister,
+                              child: Container(
+                                width: double.infinity, height: 50,
+                                decoration: BoxDecoration(
+                                  color: nameController.text.trim().isNotEmpty ? tossBlue : appleGray,
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                                child: Center(child: Text(
+                                  '이 위치에 안심존 등록하기',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold, fontSize: 14,
+                                    color: nameController.text.trim().isNotEmpty ? Colors.white : textSecondary,
+                                  ),
+                                )),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
-                    ),
                   ],
                 ),
               ),
@@ -2743,7 +2765,9 @@ class _HomeScreenState extends State<HomeScreen> {
           },
         );
       },
-    );
+    ).then((_) {
+      debounceTimer?.cancel();
+    });
   }
 
   Widget _buildBatteryBadge(int batteryLevel) {
