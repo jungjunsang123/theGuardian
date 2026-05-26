@@ -1171,7 +1171,10 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       builder: (context) {
         return Container(
-          padding: const EdgeInsets.symmetric(vertical: 20),
+          padding: EdgeInsets.only(
+            top: 20,
+            bottom: 20 + MediaQuery.of(context).padding.bottom,
+          ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -1569,7 +1572,7 @@ class _HomeScreenState extends State<HomeScreen> {
             left: 20,
             right: 20,
             top: 16,
-            bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+            bottom: MediaQuery.of(context).viewInsets.bottom + 24 + MediaQuery.of(context).padding.bottom,
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -2029,6 +2032,99 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  // -----------------------------------------------------------------------------
+  // 쌍방향 그룹 멤버 공유 중단 및 내보내기 로직
+  // -----------------------------------------------------------------------------
+  
+  // 멤버 공유 중단 확인 다이얼로그
+  void _showRemoveMemberConfirmDialog(String memberUid, String memberName, String groupId, String groupName) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: cardBg,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          title: const Text('위치 공유 중단', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17, color: tossRed)),
+          content: Text(
+            '정말 $memberName 님과의 실시간 위치 공유를 중단하시겠습니까?\n\n이 작업은 쌍방향으로 적용되어, 상대방도 회원님의 위치를 볼 수 없게 되며 그룹에서 완전히 제외됩니다.',
+            style: const TextStyle(color: textSecondary, fontSize: 13, height: 1.5),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('취소', style: TextStyle(color: textSecondary, fontWeight: FontWeight.bold)),
+            ),
+            TossBounce(
+              onTap: () {
+                Navigator.pop(context);
+                _removeFamilyMemberFromGroup(memberUid, memberName, groupId);
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: tossRed,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Text(
+                  '공유 중단',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 13),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Firestore 그룹 및 멤버 문서에서 상대방 제외 처리
+  Future<void> _removeFamilyMemberFromGroup(String memberUid, String memberName, String groupId) async {
+    try {
+      // 1. 그룹 문서의 members 배열 필드에서 제외 대상 uid 삭제
+      await FirebaseFirestore.instance
+          .collection('groups')
+          .doc(groupId)
+          .update({
+        'members': FieldValue.arrayRemove([memberUid])
+      });
+
+      // 2. 제외 대상 멤버의 activeGroupId와 groupId가 내보내진 그룹과 같다면 개인 홈으로 리셋
+      final memberDocRef = FirebaseFirestore.instance.collection('users').doc(memberUid);
+      final memberSnapshot = await memberDocRef.get();
+      
+      if (memberSnapshot.exists && memberSnapshot.data() != null) {
+        final data = memberSnapshot.data()!;
+        final String currentActiveGroup = data['activeGroupId'] ?? '';
+        
+        if (currentActiveGroup == groupId) {
+          await memberDocRef.update({
+            'groupId': memberUid,
+            'activeGroupId': memberUid,
+          });
+        }
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('$memberName 님과의 위치 공유가 해제되었습니다.'),
+            backgroundColor: tossBlue,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('멤버 내보내기 실패: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('공유 중단 도중 에러가 발생했습니다: $e'),
+            backgroundColor: tossRed,
+          ),
+        );
+      }
+    }
+  }
+
   // 안심존 설정 패널 - 목록만 표시, 추가는 지도 위 플로팅 패널로
   void _showSafeZoneSettings(List<dynamic> safeZones) {
     showModalBottomSheet(
@@ -2043,7 +2139,7 @@ class _HomeScreenState extends State<HomeScreen> {
         return Container(
           padding: EdgeInsets.only(
             left: 20, right: 20, top: 16,
-            bottom: MediaQuery.of(context).viewPadding.bottom + 24,
+            bottom: 24 + MediaQuery.of(context).padding.bottom,
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -2113,9 +2209,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
               const SizedBox(height: 20),
               TossBounce(
-                onTap: () {
+                onTap: () async {
                   Navigator.pop(context);
-                  Future.microtask(() => _showAddSafeZoneSheet());
+                  await Future.delayed(const Duration(milliseconds: 300));
+                  if (mounted) {
+                    _showAddSafeZoneSheet();
+                  }
                 },
                 child: Container(
                   width: double.infinity, height: 52,
@@ -2887,7 +2986,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         }
                       },
                       child: Container(
-                        width: 160,
+                        width: 180,
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
                           color: cardBg,
@@ -2922,6 +3021,25 @@ class _HomeScreenState extends State<HomeScreen> {
                                 const SizedBox(height: 4),
                                 _buildBatteryBadge(battery),
                               ],
+                            ),
+                          ),
+                          // 쌍방향 공유 중단 (멤버 내보내기/삭제) 버튼 추가
+                          GestureDetector(
+                            onTap: () {
+                              _showRemoveMemberConfirmDialog(
+                                familyDocs[index].id,
+                                name,
+                                activeGroupId,
+                                groupName,
+                              );
+                            },
+                            child: Padding(
+                              padding: const EdgeInsets.only(left: 4, right: 2),
+                              child: Icon(
+                                Icons.cancel_rounded,
+                                color: tossRed.withValues(alpha: 0.8),
+                                size: 18,
+                              ),
                             ),
                           ),
                         ],
