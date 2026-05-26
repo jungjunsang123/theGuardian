@@ -611,6 +611,8 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  static const _geocodingChannel = MethodChannel('com.theguardian.app/geocoding');
+  
   final TextEditingController _inviteCodeController = TextEditingController();
   final TextEditingController _zoneNameController = TextEditingController();
   final TextEditingController _searchQueryController = TextEditingController();
@@ -2274,6 +2276,27 @@ class _HomeScreenState extends State<HomeScreen> {
           builder: (ctx, setSheet) {
 
             Future<String> reverseGeocode(double lat, double lng) async {
+              // 1. Android 네이티브 Geocoder 우선 호출
+              if (!kIsWeb && Platform.isAndroid) {
+                try {
+                  final Map<dynamic, dynamic>? res = await _geocodingChannel.invokeMethod(
+                    'reverseGeocode',
+                    {'latitude': lat, 'longitude': lng},
+                  );
+                  if (res != null && res['formattedAddress'] != null) {
+                    String addr = res['formattedAddress'] as String;
+                    // "대한민국 " 접두사 정제
+                    if (addr.startsWith('대한민국 ')) {
+                      addr = addr.replaceFirst('대한민국 ', '');
+                    }
+                    return addr.trim();
+                  }
+                } catch (e) {
+                  debugPrint('네이티브 역지오코딩 실패, Nominatim API로 폴백: $e');
+                }
+              }
+
+              // 2. Fallback: Nominatim API
               try {
                 final client = HttpClient();
                 client.connectionTimeout = const Duration(seconds: 5);
@@ -2291,7 +2314,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   final String fullAddr = decoded['display_name'] ?? '';
                   final parts = fullAddr.split(',');
                   if (parts.isNotEmpty) {
-                    return parts[0].trim();
+                    String addr = parts[0].trim();
+                    if (addr.startsWith('대한민국 ')) {
+                      addr = addr.replaceFirst('대한민국 ', '');
+                    }
+                    return addr;
                   }
                   return fullAddr;
                 }
@@ -2308,18 +2335,62 @@ class _HomeScreenState extends State<HomeScreen> {
                 return;
               }
 
-              // [VETERAN TOUCH] 도로명 주소 숫자가 띄어쓰기 없이 붙어있는 경우 자동 보정 (예: 여의대로56 -> 여의대로 56)
+              // 도로명 주소 숫자가 띄어쓰기 없이 붙어있는 경우 자동 보정 (예: 여의대로56 -> 여의대로 56)
               final match = RegExp(r'^([가-힣a-zA-Z\s]+)(\d+)$').firstMatch(query);
               if (match != null) {
                 query = '${match.group(1)!.trim()} ${match.group(2)}';
               }
               
               setSheet(() { isSearching = true; results = []; });
+
+              // 1. Android 네이티브 Geocoder 우선 호출
+              if (!kIsWeb && Platform.isAndroid) {
+                try {
+                  final List<dynamic>? res = await _geocodingChannel.invokeMethod(
+                    'searchAddress',
+                    {'address': query},
+                  );
+                  if (res != null && res.isNotEmpty) {
+                    final List<dynamic> mappedResults = res.map((item) {
+                      final data = item as Map<dynamic, dynamic>;
+                      String rawAddr = (data['formattedAddress'] as String?) ?? '';
+                      if (rawAddr.startsWith('대한민국 ')) {
+                        rawAddr = rawAddr.replaceFirst('대한민국 ', '');
+                      }
+                      
+                      final String postalCode = (data['postalCode'] as String?) ?? '';
+                      final String postalText = postalCode.isNotEmpty ? ' [우편번호: $postalCode]' : '';
+                      final String fullAddr = '$rawAddr$postalText';
+                      
+                      final parts = rawAddr.split(' ');
+                      String shortName = rawAddr;
+                      if (parts.length >= 2) {
+                        shortName = '${parts[parts.length - 2]} ${parts[parts.length - 1]}';
+                      }
+
+                      return {
+                        'display_name': fullAddr,
+                        'lat': data['latitude'].toString(),
+                        'lon': data['longitude'].toString(),
+                      };
+                    }).toList();
+
+                    setSheet(() {
+                      results = mappedResults;
+                      isSearching = false;
+                    });
+                    return; // 성공 시 종료
+                  }
+                } catch (e) {
+                  debugPrint('네이티브 지오코딩 실패, Nominatim API로 폴백: $e');
+                }
+              }
+
+              // 2. Fallback: Nominatim API
               try {
                 final client = HttpClient();
                 client.connectionTimeout = const Duration(seconds: 10);
                 
-                // 검색 정확도 향상을 위해 한국 지역 우선으로 쿼리를 튜닝
                 final url = Uri.parse(
                   'https://nominatim.openstreetmap.org/search'
                   '?q=${Uri.encodeComponent(query)}'
