@@ -2982,12 +2982,11 @@ class _HomeScreenState extends State<HomeScreen> {
           });
         }
 
+        final activeGroupDocRef = FirebaseFirestore.instance.collection('groups').doc(activeGroupId);
+
         if (activeGroupId != _lastActiveGroupId || _activeGroupStream == null) {
           _lastActiveGroupId = activeGroupId;
-          _activeGroupStream = FirebaseFirestore.instance
-              .collection('groups')
-              .doc(activeGroupId)
-              .snapshots();
+          _activeGroupStream = activeGroupDocRef.snapshots();
         }
 
         return StreamBuilder<DocumentSnapshot>(
