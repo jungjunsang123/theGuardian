@@ -667,7 +667,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _isRegistering = true);
 
     try {
-      // 1. /groups 컬렉션에서 초대 코드 검색
+      // 1. /groups 컬렉션에서 초대 코드 검색 (가장 보편적인 정상 그룹 합류 경로)
       final QuerySnapshot groupQuery = await FirebaseFirestore.instance
           .collection('groups')
           .where('inviteCode', isEqualTo: code)
@@ -684,7 +684,10 @@ class _HomeScreenState extends State<HomeScreen> {
         if (members.contains(widget.user.uid)) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('이미 [$groupName] 그룹의 멤버입니다.')),
+              SnackBar(
+                content: Text('이미 [$groupName] 그룹의 멤버입니다.'),
+                backgroundColor: tossBlue,
+              ),
             );
           }
           return;
@@ -704,7 +707,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _inviteCodeController.clear();
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('[$groupName] 그룹에 참여했어요!'),
+              content: Text('[$groupName] 그룹에 성공적으로 참여했어요!'),
               backgroundColor: Theme.of(context).colorScheme.secondary,
             ),
           );
@@ -712,7 +715,7 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
-      // 2. /groups에서 못 찾았을 경우, 하위 호환성을 위해 /users에서 초대 코드 검색 (기존 개인 코드 대응)
+      // 2. /groups에서 못 찾았을 경우, 하위 호환성을 위해 /users에서 초대 코드 검색 (신규 가입 유저 등의 대응)
       final QuerySnapshot userQuery = await FirebaseFirestore.instance
           .collection('users')
           .where('inviteCode', isEqualTo: code)
@@ -723,7 +726,7 @@ class _HomeScreenState extends State<HomeScreen> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text('해당 초대 코드를 가진 그룹이나 사용자를 찾을 수 없습니다.'),
+              content: Text('해당 초대 코드를 가진 그룹이나 사용자를 찾을 수 없습니다. 다시 한번 확인해 주세요.'),
               backgroundColor: Colors.redAccent,
             ),
           );
@@ -739,28 +742,36 @@ class _HomeScreenState extends State<HomeScreen> {
       if (targetUserDoc.id == widget.user.uid) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('본인의 코드는 등록할 수 없어요.')),
+            const SnackBar(
+              content: Text('본인의 코드는 등록할 수 없습니다.'),
+              backgroundColor: tossRed,
+            ),
           );
         }
         return;
       }
 
-      // 대상의 기본 그룹이 /groups에 존재하는지 확인하고 없으면 자동 생성 후 멤버 추가
+      // [VETERAN TOUCH] 상대방의 기본 그룹이 아직 생성되지 않은 상태 보안 충돌 사전 예외 처리
       final groupDoc = await FirebaseFirestore.instance.collection('groups').doc(targetGroupId).get();
       if (!groupDoc.exists) {
-        await FirebaseFirestore.instance.collection('groups').doc(targetGroupId).set({
-          'id': targetGroupId,
-          'name': '$targetName 님의 그룹',
-          'inviteCode': code,
-          'members': [targetUserDoc.id, widget.user.uid],
-          'createdBy': targetUserDoc.id,
-          'createdAt': FieldValue.serverTimestamp(),
-        });
-      } else {
-        await FirebaseFirestore.instance.collection('groups').doc(targetGroupId).update({
-          'members': FieldValue.arrayUnion([widget.user.uid])
-        });
+        // 상대방이 회원가입만 하고 아직 메인 화면에 접속하지 않은 상태이므로 내가 억지로 타인의 문서를 set() 하여
+        // Security Rules 권한 오류(Permission Denied)를 내지 않고, 우아하게 SnackBar 안내 가이드를 제시하여 충돌을 회피합니다.
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('$targetName 님이 아직 앱 메인 지도를 켜지 않아 그룹이 미활성 상태입니다. 상대방이 앱을 최초 1회 실행한 후 다시 초대 코드를 등록해 주세요.'),
+              backgroundColor: Colors.orangeAccent,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
+        return;
       }
+
+      // 그룹이 안전하게 존재할 때만 내 UID를 추가 (보안 권한 보장)
+      await FirebaseFirestore.instance.collection('groups').doc(targetGroupId).update({
+        'members': FieldValue.arrayUnion([widget.user.uid])
+      });
 
       await FirebaseFirestore.instance.collection('users').doc(widget.user.uid).update({
         'activeGroupId': targetGroupId,
@@ -780,7 +791,10 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('그룹 참여 실패: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('참여 중 에러가 발생했어요: $e')),
+          SnackBar(
+            content: Text('참여 중 예기치 못한 에러가 발생했습니다: $e'),
+            backgroundColor: tossRed,
+          ),
         );
       }
     } finally {
