@@ -623,12 +623,25 @@ class _HomeScreenState extends State<HomeScreen> {
   NaverMapController? _mapController;
   bool _isRegistering = false;
   bool _isUpdatingOverlays = false; // 마커 업데이트 재진입 방지
+  Stream<DocumentSnapshot>? _userStream;
+  Stream<QuerySnapshot>? _myGroupsStream;
+  String _lastOverlayFingerprint = '';
+  
+  String _lastActiveGroupId = '';
+  Stream<DocumentSnapshot>? _activeGroupStream;
+  String _lastFamilyUidsFingerprint = '';
+  Stream<QuerySnapshot>? _membersStream;
 
   @override
   void initState() {
     super.initState();
     // 로그인 시 백그라운드 구동에 필요한 위치 및 알림 권한을 요청합니다.
     _requestLocationPermissions();
+    _userStream = FirebaseFirestore.instance.collection('users').doc(widget.user.uid).snapshots();
+    _myGroupsStream = FirebaseFirestore.instance
+        .collection('groups')
+        .where('members', arrayContains: widget.user.uid)
+        .snapshots();
   }
 
   @override
@@ -1503,6 +1516,18 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _updateMapOverlays(List<dynamic> safeZones, List<DocumentSnapshot> familyDocs) async {
     if (_mapController == null) return;
     if (_isUpdatingOverlays) return; // 이미 실행 중이면 건너뜀
+
+    // [VETERAN TOUCH] 불필요한 무분별한 리사이징 Rebuild 시의 깜빡임(새로고침) 차단을 위한 데이터 지문 분석
+    final String currentFingerprint = safeZones.map((z) => '${z['id']}_${z['latitude']}_${z['longitude']}').join('|') + 
+        '#' + familyDocs.map((doc) {
+          final data = doc.data() as Map<String, dynamic>? ?? {};
+          return '${doc.id}_${data['latitude']}_${data['longitude']}_${data['status']}_${data['battery']}';
+        }).join('|');
+
+    if (_lastOverlayFingerprint == currentFingerprint) {
+      return; // 데이터 변경이 없을 때는 오버레이 갱신을 생략하여 시각적 진동(깜빡임) 방지
+    }
+    _lastOverlayFingerprint = currentFingerprint;
     _isUpdatingOverlays = true;
     _mapController!.clearOverlays();
 
@@ -2900,7 +2925,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final String currentUserId = widget.user.uid;
 
     return StreamBuilder<DocumentSnapshot>(
-      stream: FirebaseFirestore.instance.collection('users').doc(currentUserId).snapshots(),
+      stream: _userStream,
       builder: (context, userSnapshot) {
         if (userSnapshot.connectionState == ConnectionState.waiting) {
           return const Scaffold(
@@ -2957,10 +2982,16 @@ class _HomeScreenState extends State<HomeScreen> {
           });
         }
 
-        final activeGroupDocRef = FirebaseFirestore.instance.collection('groups').doc(activeGroupId);
+        if (activeGroupId != _lastActiveGroupId || _activeGroupStream == null) {
+          _lastActiveGroupId = activeGroupId;
+          _activeGroupStream = FirebaseFirestore.instance
+              .collection('groups')
+              .doc(activeGroupId)
+              .snapshots();
+        }
 
         return StreamBuilder<DocumentSnapshot>(
-          stream: activeGroupDocRef.snapshots(),
+          stream: _activeGroupStream,
           builder: (context, groupSnapshot) {
             if (groupSnapshot.connectionState == ConnectionState.waiting) {
               return const Scaffold(
@@ -2999,10 +3030,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
             // 가입 그룹 전체 목록 스트림
             return StreamBuilder<QuerySnapshot>(
-              stream: FirebaseFirestore.instance
-                  .collection('groups')
-                  .where('members', arrayContains: currentUserId)
-                  .snapshots(),
+              stream: _myGroupsStream,
               builder: (context, myGroupsSnapshot) {
                 final List<DocumentSnapshot> myGroups = myGroupsSnapshot.hasData ? myGroupsSnapshot.data!.docs : [];
 
@@ -3018,12 +3046,19 @@ class _HomeScreenState extends State<HomeScreen> {
                   );
                 }
 
-                // 가족 멤버 목록 스트림
-                return StreamBuilder<QuerySnapshot>(
-                  stream: FirebaseFirestore.instance
+                // 가족 멤버 목록 스트림 캐싱 로직
+                final String currentFamilyFingerprint = familyUids.join(',');
+                if (currentFamilyFingerprint != _lastFamilyUidsFingerprint || _membersStream == null) {
+                  _lastFamilyUidsFingerprint = currentFamilyFingerprint;
+                  _membersStream = FirebaseFirestore.instance
                       .collection('users')
                       .where(FieldPath.documentId, whereIn: familyUids)
-                      .snapshots(),
+                      .snapshots();
+                }
+
+                // 가족 멤버 목록 스트림
+                return StreamBuilder<QuerySnapshot>(
+                  stream: _membersStream,
                   builder: (context, membersSnapshot) {
                     final List<DocumentSnapshot> familyDocs = membersSnapshot.hasData ? membersSnapshot.data!.docs : [];
                     
